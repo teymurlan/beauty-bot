@@ -1,9 +1,13 @@
-# bot.py — один файл
+# bot.py
 # python-telegram-bot >= 21
-# Railway Variables: BOT_TOKEN, ADMIN_ID, TZ, DB_PATH и прочее
+# Railway ENV:
+# BOT_TOKEN, ADMIN_ID, TZ, DB_PATH, SALON_NAME, ...
+# Optional:
+# WORK_START, WORK_END, SLOT_MINUTES, TIME_STEP_MINUTES, AUTO_DELETE_USER_INPUT
 
 import os
 import re
+import html
 import sqlite3
 import logging
 import secrets
@@ -18,6 +22,7 @@ from telegram import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -33,7 +38,7 @@ log = logging.getLogger("beauty-bot")
 
 
 # =========================
-# SQLite storage
+# Models
 # =========================
 @dataclass
 class User:
@@ -59,6 +64,9 @@ class Booking:
     reminder_sent: int
 
 
+# =========================
+# Storage
+# =========================
 class Storage:
     def __init__(self, path: str = "data.sqlite3"):
         self.path = path
@@ -91,7 +99,8 @@ class Storage:
                 book_time TEXT NOT NULL,
                 comment TEXT DEFAULT '',
                 status TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                reminder_sent INTEGER NOT NULL DEFAULT 0
             );
             """)
             c.execute("""
@@ -101,10 +110,8 @@ class Storage:
                 PRIMARY KEY(book_date, book_time)
             );
             """)
-
-            cols = [r["name"] for r in c.execute("PRAGMA table_info(bookings)").fetchall()]
-            if "reminder_sent" not in cols:
-                c.execute("ALTER TABLE bookings ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0;")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_bookings_day_time ON bookings(book_date, book_time);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings(user_id);")
 
     # users
     def upsert_user(self, tg_id: int, username: str, full_name: str, phone: str) -> None:
@@ -161,14 +168,6 @@ class Storage:
                             (book_date, book_time)).fetchone()
             return row is not None
 
-    def is_slot_taken(self, book_date: str, book_time: str) -> bool:
-        with self._conn() as c:
-            row = c.execute("""
-                SELECT 1 FROM bookings
-                WHERE book_date=? AND book_time=? AND status IN ('pending','confirmed')
-            """, (book_date, book_time)).fetchone()
-            return row is not None
-
     # bookings
     def create_booking(self, user_id: int, service_key: str, service_title: str, price: int,
                        book_date: str, book_time: str, comment: str) -> int:
@@ -183,9 +182,7 @@ class Storage:
     def get_booking(self, booking_id: int) -> Optional[Booking]:
         with self._conn() as c:
             row = c.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
-            if not row:
-                return None
-            return self._row_to_booking(row)
+            return self._row_to_booking(row) if row else None
 
     def set_booking_status(self, booking_id: int, status: str) -> None:
         with self._conn() as c:
@@ -195,7 +192,7 @@ class Storage:
         with self._conn() as c:
             c.execute("UPDATE bookings SET reminder_sent=1 WHERE id=?", (booking_id,))
 
-    def list_day(self, day: str) -> List[Booking]:
+    def list_day_active(self, day: str) -> List[Booking]:
         with self._conn() as c:
             rows = c.execute("""
             SELECT * FROM bookings
@@ -204,7 +201,7 @@ class Storage:
             """, (day,)).fetchall()
             return [self._row_to_booking(r) for r in rows]
 
-    def list_range(self, day_from: str, day_to: str) -> List[Booking]:
+    def list_range_active(self, day_from: str, day_to: str) -> List[Booking]:
         with self._conn() as c:
             rows = c.execute("""
             SELECT * FROM bookings
@@ -253,7 +250,7 @@ class Storage:
             comment=row["comment"] or "",
             status=row["status"],
             created_at=row["created_at"],
-            reminder_sent=int(row["reminder_sent"]) if "reminder_sent" in row.keys() else 0,
+            reminder_sent=int(row["reminder_sent"]),
         )
 
 
@@ -280,24 +277,22 @@ MASTER_EXPERIENCE = os.getenv("MASTER_EXPERIENCE", "Опыт: 5 лет").strip()
 MASTER_TEXT = os.getenv(
     "MASTER_TEXT",
     "Аккуратно, стерильно и с любовью к деталям ✨\n"
-    "Подберу форму и покрытие под ваш стиль, чтобы носилось красиво и долго.\n\n"
-    "Почему выбирают меня:\n"
-    "• стерильность и безопасность\n"
-    "• ровное покрытие и аккуратная кутикула\n"
-    "• комфортная атмосфера\n"
+    "Подберу форму и покрытие под ваш стиль, чтобы носилось красиво и долго."
 ).strip()
 MASTER_PHOTO = os.getenv("MASTER_PHOTO", "").strip()
 
 WORK_START = os.getenv("WORK_START", "08:00").strip()
 WORK_END = os.getenv("WORK_END", "23:00").strip()
-SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60").strip() or "60")
-
-ALLOWED_MANUAL_MINUTES = {0, 15, 30, 45}
+SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60").strip() or "60")         # длительность записи
+TIME_STEP_MINUTES = int(os.getenv("TIME_STEP_MINUTES", "15").strip() or "15") # шаг выбора времени
+AUTO_DELETE_USER_INPUT = os.getenv("AUTO_DELETE_USER_INPUT", "1").strip() == "1"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 if not ADMIN_ID:
     raise RuntimeError("ADMIN_ID is required")
+if 60 % TIME_STEP_MINUTES != 0:
+    raise RuntimeError("TIME_STEP_MINUTES должен делить 60 (например 5/10/15/20/30)")
 
 tz = ZoneInfo(TZ_NAME)
 store = Storage(DB_PATH)
@@ -321,20 +316,20 @@ SERVICES = {
     "design": ("Дизайн ногтей (за ноготок, от)", 50),
 }
 
-# stages
 STAGE_NONE = "none"
 STAGE_REG_NAME = "reg_name"
 STAGE_REG_PHONE = "reg_phone"
 STAGE_BOOK_COMMENT = "book_comment"
 STAGE_MANUAL_TIME = "manual_time"
 STAGE_ASK_MASTER = "ask_master"
-STAGE_ADM_BLOCK_TIME = "adm_block_time"
-STAGE_ADM_UNBLOCK_TIME = "adm_unblock_time"
 
 
 # =========================
 # Helpers
 # =========================
+def h(text: str) -> str:
+    return html.escape(str(text or ""))
+
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
@@ -372,9 +367,28 @@ def work_bounds_for_day(day_iso: str) -> Tuple[datetime, datetime]:
     d = date.fromisoformat(day_iso)
     ws = datetime.strptime(WORK_START, "%H:%M").time()
     we = datetime.strptime(WORK_END, "%H:%M").time()
-    start_dt = datetime.combine(d, ws).replace(tzinfo=tz)
-    end_dt = datetime.combine(d, we).replace(tzinfo=tz)
-    return start_dt, end_dt
+    return (
+        datetime.combine(d, ws).replace(tzinfo=tz),
+        datetime.combine(d, we).replace(tzinfo=tz),
+    )
+
+def booking_start_dt(day_iso: str, hhmm: str) -> datetime:
+    d = date.fromisoformat(day_iso)
+    hh, mm = map(int, hhmm.split(":"))
+    return datetime.combine(d, dtime(hh, mm)).replace(tzinfo=tz)
+
+def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+    return max(a_start, b_start) < min(a_end, b_end)
+
+def is_slot_taken_overlap(day_iso: str, hhmm: str) -> bool:
+    start = booking_start_dt(day_iso, hhmm)
+    end = start + timedelta(minutes=SLOT_MINUTES)
+    for b in store.list_day_active(day_iso):
+        bs = booking_start_dt(b.book_date, b.book_time)
+        be = bs + timedelta(minutes=SLOT_MINUTES)
+        if overlaps(start, end, bs, be):
+            return True
+    return False
 
 def is_time_allowed_for_booking(day_iso: str, hhmm: str) -> Tuple[bool, str]:
     parsed = parse_hhmm(hhmm)
@@ -382,24 +396,31 @@ def is_time_allowed_for_booking(day_iso: str, hhmm: str) -> Tuple[bool, str]:
         return False, "Введите время в формате HH:MM (например 17:15)."
 
     hh, mm = map(int, parsed.split(":"))
-    if mm not in ALLOWED_MANUAL_MINUTES:
-        return False, "Минуты должны быть 00 / 15 / 30 / 45 (например 17:15)."
+    if mm % TIME_STEP_MINUTES != 0:
+        return False, f"Минуты должны быть кратны шагу {TIME_STEP_MINUTES} (например 17:{TIME_STEP_MINUTES:02d})."
 
     start_dt, end_dt = work_bounds_for_day(day_iso)
-    slot_dt = datetime.combine(date.fromisoformat(day_iso), dtime(hh, mm)).replace(tzinfo=tz)
+    slot_start = booking_start_dt(day_iso, parsed)
+    slot_end = slot_start + timedelta(minutes=SLOT_MINUTES)
 
-    if slot_dt < start_dt or slot_dt > end_dt:
-        return False, f"Время должно быть в пределах {WORK_START}–{WORK_END}."
+    if slot_start < start_dt or slot_end > end_dt:
+        return False, f"Время должно быть в пределах {WORK_START}–{WORK_END} (с учетом длительности {SLOT_MINUTES} мин)."
 
-    if day_iso == now_local().date().isoformat() and slot_dt <= now_local():
-        return False, "Это время уже прошло. Выберите позже текущего."
+    if day_iso == now_local().date().isoformat() and slot_start <= now_local():
+        return False, "Это время уже прошло."
 
     if store.is_slot_blocked(day_iso, parsed):
-        return False, "Это время заблокировано. Выберите другое."
-    if store.is_slot_taken(day_iso, parsed):
-        return False, "Это время уже занято. Выберите другое."
+        return False, "Это время заблокировано."
+    if is_slot_taken_overlap(day_iso, parsed):
+        return False, "Это время уже занято."
 
     return True, parsed
+
+def enc_time(hhmm: str) -> str:
+    return hhmm.replace(":", "")
+
+def dec_time(hhmm4: str) -> str:
+    return f"{hhmm4[:2]}:{hhmm4[2:]}"
 
 
 # =========================
@@ -410,7 +431,7 @@ def main_menu_kb(user_id: int) -> ReplyKeyboardMarkup:
         ["💅 Записаться", "💳 Цены"],
         ["👩‍🎨 Обо мне", "📍 Контакты"],
         ["👤 Профиль", "📩 Вопрос мастеру"],
-        ["❌ Отменить запись"],
+        ["❌ Отменить запись", "🏠 Меню"],
     ]
     if is_admin(user_id):
         kb.append(["🛠 Админ-панель"])
@@ -425,44 +446,44 @@ def phone_request_kb() -> ReplyKeyboardMarkup:
 
 def about_master_text() -> str:
     return (
-        f"👩‍🎨 *{MASTER_NAME}*\n"
-        f"*{MASTER_EXPERIENCE}*\n\n"
-        f"{MASTER_TEXT}\n\n"
-        "Запись: нажмите *💅 Записаться* ✅"
+        f"👩‍🎨 <b>{h(MASTER_NAME)}</b>\n"
+        f"<b>{h(MASTER_EXPERIENCE)}</b>\n\n"
+        f"{h(MASTER_TEXT)}\n\n"
+        "Нажмите <b>💅 Записаться</b> ✅"
     )
 
 def prices_text() -> str:
     lines = [
-        "💳 *Цены*",
-        "",
+        "💳 <b>Цены</b>", "",
         "✨ Маникюр",
-        f"• {SERVICES['mn_no'][0]} — *{SERVICES['mn_no'][1]} ₽*",
-        f"• {SERVICES['mn_cov'][0]} — *{SERVICES['mn_cov'][1]} ₽*",
-        f"• {SERVICES['mn_cov_design'][0]} — *{SERVICES['mn_cov_design'][1]} ₽*",
+        f"• {h(SERVICES['mn_no'][0])} — <b>{SERVICES['mn_no'][1]} ₽</b>",
+        f"• {h(SERVICES['mn_cov'][0])} — <b>{SERVICES['mn_cov'][1]} ₽</b>",
+        f"• {h(SERVICES['mn_cov_design'][0])} — <b>{SERVICES['mn_cov_design'][1]} ₽</b>",
         "",
         "🦶 Педикюр",
-        f"• {SERVICES['pd_no'][0]} — *{SERVICES['pd_no'][1]} ₽*",
-        f"• {SERVICES['pd_cov'][0]} — *{SERVICES['pd_cov'][1]} ₽*",
-        f"• {SERVICES['pd_toes'][0]} — *{SERVICES['pd_toes'][1]} ₽*",
-        f"• {SERVICES['pd_heels'][0]} — *{SERVICES['pd_heels'][1]} ₽*",
+        f"• {h(SERVICES['pd_no'][0])} — <b>{SERVICES['pd_no'][1]} ₽</b>",
+        f"• {h(SERVICES['pd_cov'][0])} — <b>{SERVICES['pd_cov'][1]} ₽</b>",
+        f"• {h(SERVICES['pd_toes'][0])} — <b>{SERVICES['pd_toes'][1]} ₽</b>",
+        f"• {h(SERVICES['pd_heels'][0])} — <b>{SERVICES['pd_heels'][1]} ₽</b>",
         "",
         "🌟 Дополнительно",
-        f"• {SERVICES['ext'][0]} — *{SERVICES['ext'][1]} ₽*",
-        f"• {SERVICES['corr'][0]} — *{SERVICES['corr'][1]} ₽*",
-        f"• {SERVICES['design'][0]} — *{SERVICES['design'][1]} ₽*",
+        f"• {h(SERVICES['ext'][0])} — <b>{SERVICES['ext'][1]} ₽</b>",
+        f"• {h(SERVICES['corr'][0])} — <b>{SERVICES['corr'][1]} ₽</b>",
+        f"• {h(SERVICES['design'][0])} — <b>{SERVICES['design'][1]} ₽</b>",
     ]
     return "\n".join(lines)
 
 def contacts_text() -> str:
-    t = "📍 *Как нас найти*\n\n"
-    t += f"• {ADDRESS}\n"
-    t += f"• {HOW_TO_FIND}\n"
-    t += f"• {DOORPHONE}\n"
-    t += f"• {GATE}\n"
-    t += f"• {FLOOR}\n"
-    t += f"• {APARTMENT}\n"
-    t += f"\n🕘 Время работы: *{WORK_START}–{WORK_END}*\n"
-    return t
+    return (
+        "📍 <b>Как нас найти</b>\n\n"
+        f"• {h(ADDRESS)}\n"
+        f"• {h(HOW_TO_FIND)}\n"
+        f"• {h(DOORPHONE)}\n"
+        f"• {h(GATE)}\n"
+        f"• {h(FLOOR)}\n"
+        f"• {h(APARTMENT)}\n"
+        f"\n🕘 Время работы: <b>{h(WORK_START)}–{h(WORK_END)}</b>\n"
+    )
 
 def contacts_inline() -> Optional[InlineKeyboardMarkup]:
     rows = []
@@ -474,7 +495,7 @@ def contacts_inline() -> Optional[InlineKeyboardMarkup]:
 
 
 # =========================
-# Draft / anti-stale
+# Draft / flow
 # =========================
 def new_draft_id() -> str:
     return secrets.token_hex(3)
@@ -490,14 +511,20 @@ def get_draft(context: ContextTypes.DEFAULT_TYPE) -> str:
 def must_draft(context: ContextTypes.DEFAULT_TYPE, did: str) -> bool:
     return did and did == get_draft(context)
 
+def clear_booking_draft(context: ContextTypes.DEFAULT_TYPE):
+    for k in ["service_key", "service_title", "service_price", "book_date", "book_time",
+              "comment", "book_cat", "draft_id", "stage"]:
+        context.user_data.pop(k, None)
+
 
 # =========================
-# Booking flow keyboards
+# Keyboards
 # =========================
 def kb_start_for_new_user() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 Регистрация", callback_data="REG_START")],
         [InlineKeyboardButton("💅 Записаться", callback_data="BOOK_START")],
+        [InlineKeyboardButton("🏠 В меню", callback_data="MENU")],
     ])
 
 def kb_service_cats(did: str) -> InlineKeyboardMarkup:
@@ -509,13 +536,8 @@ def kb_service_cats(did: str) -> InlineKeyboardMarkup:
     ])
 
 def kb_services(did: str, cat: str) -> InlineKeyboardMarkup:
-    if cat == "mn":
-        keys = ["mn_no", "mn_cov", "mn_cov_design"]
-    elif cat == "pd":
-        keys = ["pd_no", "pd_cov", "pd_toes", "pd_heels"]
-    else:
-        keys = ["ext", "corr", "design"]
-
+    keys = {"mn": ["mn_no", "mn_cov", "mn_cov_design"],
+            "pd": ["pd_no", "pd_cov", "pd_toes", "pd_heels"]}.get(cat, ["ext", "corr", "design"])
     rows = []
     for k in keys:
         title, price = SERVICES[k]
@@ -547,26 +569,17 @@ def generate_time_slots(day_iso: str) -> List[str]:
     cur = start_dt
     while cur + timedelta(minutes=SLOT_MINUTES) <= end_dt:
         slots.append(cur.strftime("%H:%M"))
-        cur += timedelta(minutes=SLOT_MINUTES)
+        cur += timedelta(minutes=TIME_STEP_MINUTES)
     return slots
 
 def kb_times(did: str, day_iso: str) -> InlineKeyboardMarkup:
     slots = generate_time_slots(day_iso)
-    if day_iso == now_local().date().isoformat():
-        now_dt = now_local()
-        slots2 = []
-        for hhmm in slots:
-            hh, mm = map(int, hhmm.split(":"))
-            slot_dt = datetime.combine(now_dt.date(), dtime(hh, mm)).replace(tzinfo=tz)
-            if slot_dt > now_dt:
-                slots2.append(hhmm)
-        slots = slots2
-
     rows, row = [], []
     for t in slots:
-        if store.is_slot_blocked(day_iso, t) or store.is_slot_taken(day_iso, t):
+        ok, _ = is_time_allowed_for_booking(day_iso, t)
+        if not ok:
             continue
-        row.append(InlineKeyboardButton(t, callback_data=f"TIME:{did}:{t}"))
+        row.append(InlineKeyboardButton(t, callback_data=f"TIME:{did}:{enc_time(t)}"))
         if len(row) == 4:
             rows.append(row)
             row = []
@@ -576,7 +589,7 @@ def kb_times(did: str, day_iso: str) -> InlineKeyboardMarkup:
     if not rows:
         rows = [[InlineKeyboardButton("😕 Нет свободных слотов", callback_data="NOOP")]]
 
-    rows.append([InlineKeyboardButton("✍️ Ввести время вручную", callback_data=f"MANUAL_TIME:{did}")])
+    rows.append([InlineKeyboardButton("✍️ Ввести время вручную", callback_data=f"MANUAL_TIME:{did}:1")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"BACK_DAYS:{did}")])
     rows.append([InlineKeyboardButton("🏠 В меню", callback_data="MENU")])
     return InlineKeyboardMarkup(rows)
@@ -595,10 +608,7 @@ def kb_confirm(did: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🏠 В меню", callback_data="MENU")],
     ])
 
-
-# =========================
-# Admin panel
-# =========================
+# Admin
 def kb_admin_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📌 Ближайшие (25)", callback_data="ADM_NEXT")],
@@ -616,15 +626,117 @@ def kb_adm_confirm_cancel(booking_id: int, client_url: str) -> InlineKeyboardMar
         [InlineKeyboardButton("💬 Написать клиенту", url=client_url)],
     ])
 
+def kb_admin_days(did: str, mode: str) -> InlineKeyboardMarkup:
+    prefix = "ADM_DAYB" if mode == "block" else "ADM_DAYU"
+    rows, row = [], []
+    for iso in days_from_today(31):
+        row.append(InlineKeyboardButton(fmt_date_ru(iso), callback_data=f"{prefix}:{did}:{iso}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="ADM_PANEL")])
+    rows.append([InlineKeyboardButton("🏠 В меню", callback_data="MENU")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_admin_slots(did: str, day_iso: str, mode: str) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    blocked = set(store.list_blocked_for_day(day_iso))
+    for t in generate_time_slots(day_iso):
+        if mode == "block":
+            if t in blocked:
+                continue
+            if is_slot_taken_overlap(day_iso, t):
+                continue
+            cb = f"ADM_BSET:{did}:{enc_time(t)}"
+            label = f"⛔ {t}"
+        else:
+            if t not in blocked:
+                continue
+            cb = f"ADM_USET:{did}:{enc_time(t)}"
+            label = f"✅ {t}"
+        row.append(InlineKeyboardButton(label, callback_data=cb))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if not rows:
+        rows = [[InlineKeyboardButton("Нет слотов", callback_data="NOOP")]]
+
+    back_cb = "ADM_BLOCK" if mode == "block" else "ADM_UNBLOCK"
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_cb)])
+    rows.append([InlineKeyboardButton("🏠 В меню", callback_data="MENU")])
+    return InlineKeyboardMarkup(rows)
+
+
+# =========================
+# Message clean helpers
+# =========================
+async def safe_delete_message(bot, chat_id: int, message_id: int):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+async def cleanup_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not AUTO_DELETE_USER_INPUT:
+        return
+    if update.message:
+        await safe_delete_message(context.bot, update.effective_chat.id, update.message.message_id)
+
+async def show_flow_message(chat_id: int, context: ContextTypes.DEFAULT_TYPE, text: str,
+                            reply_markup=None, remove_reply=False):
+    old_id = context.user_data.get("flow_msg_id")
+    if old_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=old_id, text=text, parse_mode="HTML", reply_markup=reply_markup
+            )
+            return
+        except Exception:
+            pass
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="HTML",
+        reply_markup=reply_markup if not remove_reply else ReplyKeyboardRemove()
+    )
+    context.user_data["flow_msg_id"] = msg.message_id
+
+async def reset_to_menu(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, text: str = "Меню 👇"):
+    context.user_data["stage"] = STAGE_NONE
+    context.user_data.pop("flow_msg_id", None)
+    await context.bot.send_message(chat_id, text, reply_markup=main_menu_kb(user_id))
+
+
+# =========================
+# Build texts
+# =========================
+def build_confirm_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    title = context.user_data.get("service_title")
+    price = context.user_data.get("service_price")
+    d_iso = context.user_data.get("book_date")
+    t = context.user_data.get("book_time")
+    comment = context.user_data.get("comment") or "—"
+
+    if not title or not d_iso or not t:
+        return "⚠️ Сценарий устарел. Нажмите <b>💅 Записаться</b> заново."
+
+    return (
+        "Проверьте, всё верно:\n\n"
+        f"• Услуга: <b>{h(title)}</b>\n"
+        f"• Цена: <b>{price} ₽</b>\n"
+        f"• Дата/время: <b>{fmt_dt_ru(d_iso, t)}</b>\n"
+        f"• Комментарий: <b>{h(comment)}</b>\n\n"
+        "Нажмите <b>Подтвердить запись</b> ✅"
+    )
+
 
 # =========================
 # Reminders
 # =========================
-def booking_start_dt(iso_date: str, hhmm: str) -> datetime:
-    d = date.fromisoformat(iso_date)
-    hh, mm = map(int, hhmm.split(":"))
-    return datetime.combine(d, dtime(hh, mm)).replace(tzinfo=tz)
-
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     booking_id = int(context.job.data.get("booking_id"))
     b = store.get_booking(booking_id)
@@ -632,14 +744,14 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (
-        "⏰ *Напоминание о записи*\n\n"
+        "⏰ <b>Напоминание о записи</b>\n\n"
         f"• {fmt_dt_ru(b.book_date, b.book_time)}\n"
-        f"• {b.service_title}\n\n"
+        f"• {h(b.service_title)}\n\n"
         f"{contacts_text()}\n"
-        "Если планы изменились — нажмите *❌ Отменить запись*."
+        "Если планы изменились — нажмите <b>❌ Отменить запись</b>."
     )
     try:
-        await context.bot.send_message(b.user_id, text, parse_mode="Markdown", reply_markup=contacts_inline())
+        await context.bot.send_message(b.user_id, text, parse_mode="HTML", reply_markup=contacts_inline())
         store.mark_reminder_sent(b.id)
     except Exception as e:
         log.exception("Reminder send failed: %s", e)
@@ -660,86 +772,66 @@ def schedule_reminder(app: Application, booking_id: int, iso_date: str, hhmm: st
 def reschedule_all_reminders(app: Application):
     now = now_local()
     for b in store.list_for_reminders():
-        start_dt = booking_start_dt(b.book_date, b.book_time)
-        if start_dt <= now:
-            continue
-        schedule_reminder(app, b.id, b.book_date, b.book_time)
+        if booking_start_dt(b.book_date, b.book_time) > now:
+            schedule_reminder(app, b.id, b.book_date, b.book_time)
 
 
 # =========================
-# Registration flow
-# =========================
-async def reg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["stage"] = STAGE_REG_NAME
-    await update.effective_chat.send_message(
-        "📝 Регистрация (1 раз)\n\nКак к вам обращаться? (имя)",
-        reply_markup=main_menu_kb(update.effective_user.id)
-    )
-
-# =========================
-# /start
+# Handlers
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    context.user_data["stage"] = STAGE_NONE
-
-    # НЕ сбрасываем пользователя каждый раз, но сбросим черновик записи:
-    for k in ["service_key", "service_title", "service_price", "book_date", "book_time", "comment", "book_cat", "draft_id"]:
-        context.user_data.pop(k, None)
+    clear_booking_draft(context)
 
     intro = (
-        f"✨ *{SALON_NAME}*\n\n"
-        "Я помогу вам записаться на маникюр/педикюр в пару кликов:\n"
+        f"✨ <b>{h(SALON_NAME)}</b>\n\n"
+        "Я помогу записаться в пару кликов:\n"
         "1) выбрать услугу\n"
         "2) выбрать дату и время\n"
-        "3) подтвердить запись ✅\n\n"
-        "Выберите действие в меню 👇"
+        "3) подтвердить запись ✅"
     )
-
-    await update.message.reply_text(intro, parse_mode="Markdown", reply_markup=main_menu_kb(uid))
-
+    await update.message.reply_text(intro, parse_mode="HTML", reply_markup=main_menu_kb(uid))
     u = store.get_user(uid)
     if not u:
-        await update.message.reply_text(
-            "Чтобы записаться, нужна регистрация (1 раз).",
-            reply_markup=kb_start_for_new_user()
-        )
+        await update.message.reply_text("Чтобы записаться, нужна регистрация (1 раз).", reply_markup=kb_start_for_new_user())
     else:
-        await update.message.reply_text("Можно сразу нажать *💅 Записаться* 🙂", parse_mode="Markdown")
+        await update.message.reply_text("Можно сразу нажать <b>💅 Записаться</b> 🙂", parse_mode="HTML")
 
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await reset_to_menu(update.effective_chat.id, update.effective_user.id, context)
 
-# =========================
-# Contact handler
-# =========================
+async def reg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["stage"] = STAGE_REG_NAME
+    await show_flow_message(
+        chat_id=update.effective_chat.id,
+        context=context,
+        text="📝 Регистрация (1 раз)\n\nКак к вам обращаться? (имя)",
+        remove_reply=True,
+    )
+
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("stage") != STAGE_REG_PHONE:
         return
-
-    phone = update.message.contact.phone_number if update.message.contact else ""
-    phone = parse_phone(phone)
+    phone = parse_phone(update.message.contact.phone_number if update.message.contact else "")
     if len(re.sub(r"\D", "", phone)) < 10:
-        await update.message.reply_text("Номер не распознан 😕 Нажмите «📱 Отправить номер».", reply_markup=phone_request_kb())
+        await update.message.reply_text("Номер не распознан. Нажмите «📱 Отправить номер».", reply_markup=phone_request_kb())
         return
 
     uid = update.effective_user.id
     name = context.user_data.get("reg_name", update.effective_user.full_name or "Клиент")
     store.upsert_user(uid, update.effective_user.username or "", name, phone)
-
     context.user_data["stage"] = STAGE_NONE
-    await update.message.reply_text(f"✅ Готово, *{name}*! Теперь можно записаться 💅", parse_mode="Markdown",
-                                    reply_markup=main_menu_kb(uid))
 
+    await reset_to_menu(update.effective_chat.id, uid, context, f"✅ Готово, {h(name)}! Теперь можно записаться 💅")
+    await cleanup_user_input(update, context)
 
-# =========================
-# Text handler
-# =========================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     txt = (update.message.text or "").strip()
     stage = context.user_data.get("stage", STAGE_NONE)
     u = store.get_user(uid)
 
-    # REG name
+    # registration flow
     if stage == STAGE_REG_NAME:
         if len(txt) < 2:
             await update.message.reply_text("Напишите имя чуть понятнее 🙂")
@@ -747,19 +839,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["reg_name"] = txt
         context.user_data["stage"] = STAGE_REG_PHONE
         await update.message.reply_text("Отправьте номер кнопкой ниже:", reply_markup=phone_request_kb())
+        await cleanup_user_input(update, context)
         return
 
-    # REG phone in text
     if stage == STAGE_REG_PHONE:
         phone = parse_phone(txt)
         if len(re.sub(r"\D", "", phone)) < 10:
-            await update.message.reply_text("Нажмите «📱 Отправить номер» (так без ошибок).", reply_markup=phone_request_kb())
+            await update.message.reply_text("Нажмите «📱 Отправить номер».", reply_markup=phone_request_kb())
             return
         name = context.user_data.get("reg_name", update.effective_user.full_name or "Клиент")
         store.upsert_user(uid, update.effective_user.username or "", name, phone)
         context.user_data["stage"] = STAGE_NONE
-        await update.message.reply_text(f"✅ Готово, *{name}*! Теперь можно записаться 💅", parse_mode="Markdown",
-                                        reply_markup=main_menu_kb(uid))
+        await reset_to_menu(update.effective_chat.id, uid, context, f"✅ Готово, {h(name)}! Теперь можно записаться 💅")
+        await cleanup_user_input(update, context)
         return
 
     # manual time
@@ -768,74 +860,79 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         day_iso = context.user_data.get("book_date")
         if not did or not day_iso:
             context.user_data["stage"] = STAGE_NONE
-            await update.message.reply_text("Сценарий устарел. Нажмите 💅 Записаться заново.", reply_markup=main_menu_kb(uid))
+            await reset_to_menu(update.effective_chat.id, uid, context, "Сценарий устарел. Нажмите 💅 Записаться заново.")
             return
-
         ok, res = is_time_allowed_for_booking(day_iso, txt)
         if not ok:
-            await update.message.reply_text(f"😕 {res}\nВведите время ещё раз (например 17:15).")
+            await update.message.reply_text(f"😕 {res}\nВведите время ещё раз.")
             return
-
         context.user_data["book_time"] = res
         context.user_data["stage"] = STAGE_BOOK_COMMENT
-        await update.message.reply_text("Добавьте комментарий (необязательно). Или нажмите «Без комментария».",
-                                        reply_markup=kb_comment(did))
+        await show_flow_message(update.effective_chat.id, context,
+                                "Добавьте комментарий (необязательно) или нажмите «Без комментария».",
+                                reply_markup=kb_comment(did))
+        await cleanup_user_input(update, context)
         return
 
-    # book comment as text
+    # comment text
     if stage == STAGE_BOOK_COMMENT:
         did = get_draft(context)
         if not did:
             context.user_data["stage"] = STAGE_NONE
-            await update.message.reply_text("Сценарий устарел. Нажмите 💅 Записаться заново.", reply_markup=main_menu_kb(uid))
+            await reset_to_menu(update.effective_chat.id, uid, context, "Сценарий устарел. Нажмите 💅 Записаться заново.")
             return
         context.user_data["comment"] = txt
         context.user_data["stage"] = STAGE_NONE
-        await update.message.reply_text(build_confirm_text(context), parse_mode="Markdown", reply_markup=kb_confirm(did))
+        await show_flow_message(update.effective_chat.id, context, build_confirm_text(context), reply_markup=kb_confirm(did))
+        await cleanup_user_input(update, context)
         return
 
     # ask master
     if stage == STAGE_ASK_MASTER:
-        uu = store.get_user(uid)
-        who = f"{uu.full_name} ({uu.phone})" if uu else (update.effective_user.full_name or "Клиент")
+        who = f"{u.full_name} ({u.phone})" if u else (update.effective_user.full_name or "Клиент")
         link = user_link(uid, update.effective_user.username or "")
-        msg = f"📩 *Вопрос мастеру*\nОт: *{who}*\n{link}\n\n{txt}"
+        msg = f"📩 <b>Вопрос мастеру</b>\nОт: <b>{h(who)}</b>\n{h(link)}\n\n{h(txt)}"
         try:
-            await context.bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
-            await update.message.reply_text("✅ Отправил мастеру. Мы ответим вам скоро 🙂", reply_markup=main_menu_kb(uid))
+            await context.bot.send_message(ADMIN_ID, msg, parse_mode="HTML")
+            await reset_to_menu(update.effective_chat.id, uid, context, "✅ Отправил мастеру. Скоро ответим 🙂")
         except Exception as e:
             log.exception("Send to admin failed: %s", e)
-            await update.message.reply_text(
-                "⚠️ Не удалось отправить мастеру.\n"
-                "Проверьте ADMIN_ID и что мастер нажал /start в этом боте.",
-                reply_markup=main_menu_kb(uid)
-            )
-        context.user_data["stage"] = STAGE_NONE
+            await reset_to_menu(update.effective_chat.id, uid, context,
+                                "⚠️ Не удалось отправить. Проверьте ADMIN_ID и /start у мастера.")
+        await cleanup_user_input(update, context)
         return
 
     # menu buttons
+    if txt in ("🏠 Меню",):
+        await reset_to_menu(update.effective_chat.id, uid, context)
+        await cleanup_user_input(update, context)
+        return
+
     if txt == "💅 Записаться":
         if not u:
-            await update.message.reply_text("Сначала регистрация (1 раз) 🙂", reply_markup=kb_start_for_new_user())
+            await update.message.reply_text("Сначала регистрация 🙂", reply_markup=kb_start_for_new_user())
             return
         did = set_draft(context)
-        await update.message.reply_text("Выберите категорию услуги:", reply_markup=kb_service_cats(did))
+        await show_flow_message(update.effective_chat.id, context, "Выберите категорию услуги:",
+                                reply_markup=kb_service_cats(did), remove_reply=True)
+        await cleanup_user_input(update, context)
         return
 
     if txt == "💳 Цены":
-        await update.message.reply_text(prices_text(), parse_mode="Markdown", reply_markup=main_menu_kb(uid))
+        await update.message.reply_text(prices_text(), parse_mode="HTML", reply_markup=main_menu_kb(uid))
         return
 
     if txt == "👩‍🎨 Обо мне":
         if MASTER_PHOTO:
-            await update.message.reply_photo(MASTER_PHOTO, caption=about_master_text(), parse_mode="Markdown",
+            await update.message.reply_photo(MASTER_PHOTO, caption=about_master_text(), parse_mode="HTML",
                                              reply_markup=main_menu_kb(uid))
         else:
-            await update.message.reply_text(about_master_text(), parse_mode="Markdown", reply_markup=main_menu_kb(uid))
+            await update.message.reply_text(about_master_text(), parse_mode="HTML", reply_markup=main_menu_kb(uid))
         return
 
     if txt == "📍 Контакты":
-        await update.message.reply_text(contacts_text(), parse_mode="Markdown", reply_markup=contacts_inline() or main_menu_kb(uid))
+        await update.message.reply_text(contacts_text(), parse_mode="HTML",
+                                        reply_markup=contacts_inline() or main_menu_kb(uid))
         return
 
     if txt == "👤 Профиль":
@@ -844,12 +941,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         link = user_link(u.tg_id, u.username)
         await update.message.reply_text(
-            "👤 *Профиль*\n\n"
-            f"• Имя: *{u.full_name}*\n"
-            f"• Телефон: *{u.phone}*\n"
-            f"• Telegram: {link}\n\n"
-            "Чтобы сбросить профиль — напишите: `Сброс профиля`",
-            parse_mode="Markdown",
+            "👤 <b>Профиль</b>\n\n"
+            f"• Имя: <b>{h(u.full_name)}</b>\n"
+            f"• Телефон: <b>{h(u.phone)}</b>\n"
+            f"• Telegram: {h(link)}\n\n"
+            "Чтобы сбросить профиль — напишите: <code>Сброс профиля</code>",
+            parse_mode="HTML",
             reply_markup=main_menu_kb(uid)
         )
         return
@@ -861,143 +958,110 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if txt == "📩 Вопрос мастеру":
         if not u:
-            await update.message.reply_text("Сначала регистрация (1 раз) 🙂", reply_markup=kb_start_for_new_user())
+            await update.message.reply_text("Сначала регистрация 🙂", reply_markup=kb_start_for_new_user())
             return
         context.user_data["stage"] = STAGE_ASK_MASTER
-        await update.message.reply_text("Напишите ваш вопрос мастеру одним сообщением ✍️",
-                                        reply_markup=main_menu_kb(uid))
+        await update.message.reply_text("Напишите вопрос одним сообщением ✍️", reply_markup=ReplyKeyboardRemove())
         return
 
     if txt == "❌ Отменить запись":
         if not u:
-            await update.message.reply_text("Сначала регистрация (1 раз) 🙂", reply_markup=kb_start_for_new_user())
+            await update.message.reply_text("Сначала регистрация 🙂", reply_markup=kb_start_for_new_user())
             return
         items = store.list_user_upcoming(uid)
         if not items:
             await update.message.reply_text("У вас нет активных записей 🙂", reply_markup=main_menu_kb(uid))
             return
         did = set_draft(context)
-        rows = []
-        for b in items:
-            rows.append([InlineKeyboardButton(f"❌ {fmt_dt_ru(b.book_date, b.book_time)} — {b.service_title}",
-                                              callback_data=f"UCANCEL:{did}:{b.id}")])
+        rows = [[InlineKeyboardButton(f"❌ {fmt_dt_ru(b.book_date, b.book_time)} — {b.service_title}",
+                                      callback_data=f"UCANCEL:{did}:{b.id}")]
+                for b in items]
         rows.append([InlineKeyboardButton("🏠 В меню", callback_data="MENU")])
-        await update.message.reply_text("Выберите запись для отмены:", reply_markup=InlineKeyboardMarkup(rows))
+        await show_flow_message(update.effective_chat.id, context, "Выберите запись для отмены:",
+                                reply_markup=InlineKeyboardMarkup(rows), remove_reply=True)
         return
 
     if txt == "🛠 Админ-панель" and is_admin(uid):
-        await update.message.reply_text("🛠 Админ-панель", reply_markup=kb_admin_panel())
+        await show_flow_message(update.effective_chat.id, context, "🛠 Админ-панель",
+                                reply_markup=kb_admin_panel(), remove_reply=True)
         return
 
     await update.message.reply_text("Выберите действие в меню 👇", reply_markup=main_menu_kb(uid))
 
 
-def build_confirm_text(context: ContextTypes.DEFAULT_TYPE) -> str:
-    title = context.user_data.get("service_title")
-    price = context.user_data.get("service_price")
-    d_iso = context.user_data.get("book_date")
-    t = context.user_data.get("book_time")
-    comment = context.user_data.get("comment") or "—"
-
-    if not title or not d_iso or not t:
-        return "⚠️ Сценарий устарел. Нажмите *💅 Записаться* заново 🙂"
-
-    return (
-        "Проверьте, всё верно:\n\n"
-        f"• Услуга: *{title}*\n"
-        f"• Цена: *{price} ₽*\n"
-        f"• Дата/время: *{fmt_dt_ru(d_iso, t)}*\n"
-        f"• Комментарий: *{comment}*\n\n"
-        "Нажмите *Подтвердить* — и заявка уйдёт мастеру ✅"
-    )
-
-
-# =========================
-# Callbacks
-# =========================
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+    chat_id = q.message.chat_id
     data = q.data or ""
 
-    # universal
-    if data == "MENU":
-        context.user_data["stage"] = STAGE_NONE
-        await q.message.reply_text("Меню 👇", reply_markup=main_menu_kb(uid))
-        return
+    def split3(prefix: str) -> Optional[Tuple[str, str]]:
+        if not data.startswith(prefix + ":"):
+            return None
+        parts = data.split(":", 2)
+        return (parts[1], parts[2]) if len(parts) == 3 else None
 
     if data == "NOOP":
         return
 
-    # registration buttons
+    if data == "MENU":
+        clear_booking_draft(context)
+        await reset_to_menu(chat_id, uid, context)
+        return
+
+    if data == "ADM_PANEL" and is_admin(uid):
+        await show_flow_message(chat_id, context, "🛠 Админ-панель", reply_markup=kb_admin_panel())
+        return
+
+    # registration quick
     if data == "REG_START":
         await reg_start(update, context)
         return
 
     if data == "BOOK_START":
-        # if no user -> start registration, but NOT instantly ask name without explanation
         u = store.get_user(uid)
         if not u:
-            await q.message.reply_text(
-                "Для записи нужна регистрация (1 раз).\n"
-                "Сейчас спрошу имя и телефон — это займёт 10 секунд 🙂"
-            )
+            await show_flow_message(chat_id, context,
+                                    "Для записи нужна регистрация (1 раз).\nСейчас спрошу имя и телефон 🙂")
             await reg_start(update, context)
             return
         did = set_draft(context)
-        await q.message.reply_text("Выберите категорию услуги:", reply_markup=kb_service_cats(did))
+        await show_flow_message(chat_id, context, "Выберите категорию услуги:",
+                                reply_markup=kb_service_cats(did), remove_reply=True)
         return
 
-    # parse patterns with draft id
-    def split3(prefix: str) -> Optional[Tuple[str, str]]:
-        # PREFIX:did:payload
-        if not data.startswith(prefix + ":"):
-            return None
-        rest = data.split(":", 2)
-        if len(rest) != 3:
-            return None
-        return rest[1], rest[2]
-
-    # back buttons
+    # back
     if data.startswith("BACK_CATS:"):
         did = data.split(":", 1)[1]
-        if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Нажмите 💅 Записаться заново 🙂")
-            return
-        await q.message.reply_text("Выберите категорию услуги:", reply_markup=kb_service_cats(did))
+        if must_draft(context, did):
+            await show_flow_message(chat_id, context, "Выберите категорию услуги:", reply_markup=kb_service_cats(did))
         return
 
     if data.startswith("BACK_SVC:"):
         did = data.split(":", 1)[1]
         if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Нажмите 💅 Записаться заново 🙂")
             return
         cat = context.user_data.get("book_cat")
         if not cat:
-            await q.message.reply_text("Выберите категорию услуги:", reply_markup=kb_service_cats(did))
+            await show_flow_message(chat_id, context, "Выберите категорию услуги:", reply_markup=kb_service_cats(did))
             return
-        await q.message.reply_text("Выберите услугу:", reply_markup=kb_services(did, cat))
+        await show_flow_message(chat_id, context, "Выберите услугу:", reply_markup=kb_services(did, cat))
         return
 
     if data.startswith("BACK_DAYS:"):
         did = data.split(":", 1)[1]
-        if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Нажмите 💅 Записаться заново 🙂")
-            return
-        await q.message.reply_text("Выберите дату:", reply_markup=kb_days(did))
+        if must_draft(context, did):
+            await show_flow_message(chat_id, context, "Выберите дату:", reply_markup=kb_days(did))
         return
 
     if data.startswith("BACK_TIMES:"):
         did = data.split(":", 1)[1]
         if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Нажмите 💅 Записаться заново 🙂")
             return
         day_iso = context.user_data.get("book_date")
-        if not day_iso:
-            await q.message.reply_text("Выберите дату:", reply_markup=kb_days(did))
-            return
-        await q.message.reply_text("Выберите время:", reply_markup=kb_times(did, day_iso))
+        if day_iso:
+            await show_flow_message(chat_id, context, "Выберите время:", reply_markup=kb_times(did, day_iso))
         return
 
     # category
@@ -1005,10 +1069,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if p:
         did, cat = p
         if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Нажмите 💅 Записаться заново 🙂")
             return
         context.user_data["book_cat"] = cat
-        await q.message.reply_text("Выберите услугу:", reply_markup=kb_services(did, cat))
+        await show_flow_message(chat_id, context, "Выберите услугу:", reply_markup=kb_services(did, cat))
         return
 
     # service
@@ -1016,7 +1079,8 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if p:
         did, key = p
         if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Нажмите 💅 Записаться заново 🙂")
+            return
+        if key not in SERVICES:
             return
         title, price = SERVICES[key]
         context.user_data["service_key"] = key
@@ -1025,11 +1089,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("book_date", None)
         context.user_data.pop("book_time", None)
         context.user_data.pop("comment", None)
-        await q.message.reply_text(
-            f"Вы выбрали:\n*{title}* — *{price} ₽*\n\nВыберите дату:",
-            parse_mode="Markdown",
-            reply_markup=kb_days(did)
-        )
+        await show_flow_message(chat_id, context,
+                                f"Вы выбрали:\n<b>{h(title)}</b> — <b>{price} ₽</b>\n\nВыберите дату:",
+                                reply_markup=kb_days(did))
         return
 
     # day
@@ -1037,79 +1099,69 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if p:
         did, day_iso = p
         if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Нажмите 💅 Записаться заново 🙂")
             return
         context.user_data["book_date"] = day_iso
         context.user_data.pop("book_time", None)
-        await q.message.reply_text(
-            f"Дата: *{fmt_date_ru(day_iso)}*\nВыберите время:",
-            parse_mode="Markdown",
-            reply_markup=kb_times(did, day_iso)
-        )
+        await show_flow_message(chat_id, context,
+                                f"Дата: <b>{fmt_date_ru(day_iso)}</b>\nВыберите время:",
+                                reply_markup=kb_times(did, day_iso))
         return
 
     # time
     p = split3("TIME")
     if p:
-        did, hhmm = p
+        did, hhmm4 = p
         if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Нажмите 💅 Записаться заново 🙂")
             return
         day_iso = context.user_data.get("book_date")
         if not day_iso:
-            await q.message.reply_text("Выберите дату:", reply_markup=kb_days(did))
+            await show_flow_message(chat_id, context, "Сначала выберите дату:", reply_markup=kb_days(did))
             return
+        hhmm = dec_time(hhmm4)
         ok, res = is_time_allowed_for_booking(day_iso, hhmm)
         if not ok:
-            await q.message.reply_text(f"😕 {res}")
-            await q.message.reply_text("Выберите время:", reply_markup=kb_times(did, day_iso))
+            await show_flow_message(chat_id, context, f"😕 {res}\nВыберите другое время:", reply_markup=kb_times(did, day_iso))
             return
         context.user_data["book_time"] = res
         context.user_data["stage"] = STAGE_BOOK_COMMENT
-        await q.message.reply_text("Добавьте комментарий (необязательно). Или нажмите «Без комментария».",
-                                   reply_markup=kb_comment(did))
+        await show_flow_message(chat_id, context,
+                                "Добавьте комментарий (необязательно) или нажмите «Без комментария».",
+                                reply_markup=kb_comment(did))
         return
 
-    # manual time
     p = split3("MANUAL_TIME")
     if p:
         did, _ = p
         if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Нажмите 💅 Записаться заново 🙂")
-            return
-        if not context.user_data.get("book_date"):
-            await q.message.reply_text("Сначала выберите дату:", reply_markup=kb_days(did))
             return
         context.user_data["stage"] = STAGE_MANUAL_TIME
-        await q.message.reply_text("Введите время вручную (например 17:15). Минуты: 00/15/30/45")
+        await show_flow_message(chat_id, context,
+                                f"Введите время вручную (например 17:15).\nШаг: {TIME_STEP_MINUTES} минут.")
         return
 
     # comment
     if data.startswith("COMMENT:"):
-        # COMMENT:did:-
-        rest = data.split(":", 2)
-        if len(rest) != 3:
+        parts = data.split(":", 2)
+        if len(parts) != 3:
             return
-        did = rest[1]
-        payload = rest[2]
+        did, payload = parts[1], parts[2]
         if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Нажмите 💅 Записаться заново 🙂")
             return
         context.user_data["comment"] = "" if payload == "-" else payload
         context.user_data["stage"] = STAGE_NONE
-        await q.message.reply_text(build_confirm_text(context), parse_mode="Markdown", reply_markup=kb_confirm(did))
+        await show_flow_message(chat_id, context, build_confirm_text(context), reply_markup=kb_confirm(did))
         return
 
-    # confirm
+    # confirm booking by client
     if data.startswith("CONFIRM:"):
         did = data.split(":", 1)[1]
         if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Нажмите 💅 Записаться заново 🙂")
+            await show_flow_message(chat_id, context, "Кнопки устарели. Нажмите 💅 Записаться заново.")
             return
 
         u = store.get_user(uid)
         if not u:
-            await q.message.reply_text("Сначала регистрация (1 раз) 🙂", reply_markup=kb_start_for_new_user())
+            await show_flow_message(chat_id, context, "Сначала регистрация.", reply_markup=kb_start_for_new_user())
             return
 
         key = context.user_data.get("service_key")
@@ -1120,211 +1172,248 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         comment = context.user_data.get("comment", "")
 
         if not (key and title and d_iso and t and price > 0):
-            await q.message.reply_text("⚠️ Сценарий устарел. Нажмите 💅 Записаться заново 🙂")
+            await show_flow_message(chat_id, context, "⚠️ Сценарий устарел. Нажмите 💅 Записаться заново.")
             return
 
         ok, checked = is_time_allowed_for_booking(d_iso, t)
         if not ok:
-            await q.message.reply_text(f"😕 {checked}")
-            await q.message.reply_text("Выберите время:", reply_markup=kb_times(did, d_iso))
+            await show_flow_message(chat_id, context, f"😕 {checked}\nВыберите другое время:", reply_markup=kb_times(did, d_iso))
             return
 
         booking_id = store.create_booking(u.tg_id, key, title, price, d_iso, checked, comment)
         schedule_reminder(context.application, booking_id, d_iso, checked)
 
-        await q.message.reply_text(
-            "✅ *Запись создана!*\n\n"
+        await show_flow_message(
+            chat_id, context,
+            "✅ <b>Запись создана!</b>\n\n"
             f"• {fmt_dt_ru(d_iso, checked)}\n"
-            f"• {title}\n\n"
-            "Ожидайте подтверждение 🙂",
-            parse_mode="Markdown"
+            f"• {h(title)}\n\n"
+            "Ожидайте подтверждение мастера 🙂"
         )
 
-        # notify admin (ВАЖНО: показываем ошибку пользователю, если не удалось)
+        # notify admin (важно: HTML escaping, чтобы не падало на спецсимволах)
         client_url = user_link(u.tg_id, u.username)
         admin_text = (
-            "🆕 *Новая запись*\n\n"
-            f"• Клиент: *{u.full_name}*\n"
-            f"• Телефон: *{u.phone}*\n"
-            f"• TG: {client_url}\n"
-            f"• Услуга: *{title}* — *{price} ₽*\n"
-            f"• Дата/время: *{fmt_dt_ru(d_iso, checked)}*\n"
-            f"• Комментарий: *{comment or '—'}*\n\n"
-            f"ID записи: `{booking_id}`"
+            "🆕 <b>Новая запись</b>\n\n"
+            f"• Клиент: <b>{h(u.full_name)}</b>\n"
+            f"• Телефон: <b>{h(u.phone)}</b>\n"
+            f"• TG: {h(client_url)}\n"
+            f"• Услуга: <b>{h(title)}</b> — <b>{price} ₽</b>\n"
+            f"• Дата/время: <b>{fmt_dt_ru(d_iso, checked)}</b>\n"
+            f"• Комментарий: <b>{h(comment or '—')}</b>\n\n"
+            f"ID записи: <code>{booking_id}</code>"
         )
         try:
             await context.bot.send_message(
-                ADMIN_ID,
-                admin_text,
-                parse_mode="Markdown",
+                ADMIN_ID, admin_text, parse_mode="HTML",
                 reply_markup=kb_adm_confirm_cancel(booking_id, client_url)
             )
         except Exception as e:
             log.exception("Send booking to admin failed: %s", e)
-            await q.message.reply_text(
-                "⚠️ Запись сохранена, но я не смог отправить её мастеру.\n"
-                "Проверьте:\n"
-                "1) ADMIN_ID правильный\n"
-                "2) мастер нажал /start в этом боте (иначе Telegram блокирует сообщения бота)\n"
+            await context.bot.send_message(
+                chat_id,
+                "⚠️ Запись сохранена, но уведомление мастеру не отправилось.\n"
+                "Проверьте ADMIN_ID и что мастер нажал /start в боте."
             )
 
-        # очистить черновик
-        for k in ["service_key", "service_title", "service_price", "book_date", "book_time", "comment", "book_cat", "draft_id"]:
-            context.user_data.pop(k, None)
-        context.user_data["stage"] = STAGE_NONE
+        clear_booking_draft(context)
+        await context.bot.send_message(chat_id, "🏠 Вернуться в меню", reply_markup=main_menu_kb(uid))
         return
 
-    # cancel by user
+    # user cancel booking
     if data.startswith("UCANCEL:"):
-        # UCANCEL:did:booking_id
         parts = data.split(":", 2)
         if len(parts) != 3:
             return
         did, bid_s = parts[1], parts[2]
         if not must_draft(context, did):
-            await q.message.reply_text("Кнопки устарели. Откройте «❌ Отменить запись» заново 🙂")
             return
         b = store.get_booking(int(bid_s))
         if not b or b.user_id != uid:
-            await q.message.reply_text("Запись не найдена.")
+            await show_flow_message(chat_id, context, "Запись не найдена.")
             return
         store.set_booking_status(b.id, "cancelled")
-        await q.message.reply_text("✅ Запись отменена.")
+        await show_flow_message(chat_id, context, "✅ Запись отменена.")
+        await context.bot.send_message(chat_id, "Меню 👇", reply_markup=main_menu_kb(uid))
         return
 
-    # ================= ADMIN callbacks =================
+    # ======= ADMIN =======
     if data == "ADM_NEXT" and is_admin(uid):
         items = store.list_next(25)
         if not items:
-            await q.message.reply_text("Ближайших записей нет 🙂")
+            await show_flow_message(chat_id, context, "Ближайших записей нет 🙂")
             return
-        lines = ["📌 *Ближайшие записи*", ""]
+        lines = ["📌 <b>Ближайшие записи</b>", ""]
         for b in items:
             uu = store.get_user(b.user_id)
             who = f"{uu.full_name} ({uu.phone})" if uu else str(b.user_id)
-            lines.append(f"• *{fmt_dt_ru(b.book_date, b.book_time)}* — {b.service_title} — {who} (ID `{b.id}`)")
-        await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            lines.append(f"• <b>{fmt_dt_ru(b.book_date, b.book_time)}</b> — {h(b.service_title)} — {h(who)} (ID <code>{b.id}</code>)")
+        await show_flow_message(chat_id, context, "\n".join(lines))
         return
 
     if data == "ADM_TODAY" and is_admin(uid):
         today_iso = now_local().date().isoformat()
-        items = store.list_day(today_iso)
+        items = store.list_day_active(today_iso)
         if not items:
-            await q.message.reply_text("На сегодня записей нет 🙂")
+            await show_flow_message(chat_id, context, "На сегодня записей нет 🙂")
             return
-        lines = [f"📅 *Сегодня* ({fmt_date_ru(today_iso)})", ""]
+        lines = [f"📅 <b>Сегодня</b> ({fmt_date_ru(today_iso)})", ""]
         for b in items:
             uu = store.get_user(b.user_id)
             who = f"{uu.full_name} ({uu.phone})" if uu else str(b.user_id)
-            lines.append(f"• *{b.book_time}* — {b.service_title} — {who} (ID `{b.id}`)")
-        await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            lines.append(f"• <b>{b.book_time}</b> — {h(b.service_title)} — {h(who)} (ID <code>{b.id}</code>)")
+        await show_flow_message(chat_id, context, "\n".join(lines))
         return
 
     if data == "ADM_7D" and is_admin(uid):
         today = now_local().date()
         day_from = today.isoformat()
         day_to = (today + timedelta(days=6)).isoformat()
-        items = store.list_range(day_from, day_to)
+        items = store.list_range_active(day_from, day_to)
         if not items:
-            await q.message.reply_text("На ближайшие 7 дней записей нет 🙂")
+            await show_flow_message(chat_id, context, "На ближайшие 7 дней записей нет 🙂")
             return
-        lines = [f"📆 *Записи на 7 дней* ({fmt_date_ru(day_from)} — {fmt_date_ru(day_to)})", ""]
+        lines = [f"📆 <b>Записи на 7 дней</b> ({fmt_date_ru(day_from)} — {fmt_date_ru(day_to)})", ""]
         cur = ""
         for b in items:
             if b.book_date != cur:
                 cur = b.book_date
-                lines.append(f"\n*{fmt_date_ru(cur)}*")
+                lines.append(f"\n<b>{fmt_date_ru(cur)}</b>")
             uu = store.get_user(b.user_id)
             who = f"{uu.full_name} ({uu.phone})" if uu else str(b.user_id)
-            lines.append(f"• *{b.book_time}* — {b.service_title} — {who} (ID `{b.id}`)")
-        await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            lines.append(f"• <b>{b.book_time}</b> — {h(b.service_title)} — {h(who)} (ID <code>{b.id}</code>)")
+        await show_flow_message(chat_id, context, "\n".join(lines))
         return
 
     if data.startswith("ADM_CONFIRM:") and is_admin(uid):
         booking_id = int(data.split(":", 1)[1])
         b = store.get_booking(booking_id)
         if not b:
-            await q.message.reply_text("Запись не найдена.")
+            await show_flow_message(chat_id, context, "Запись не найдена.")
             return
         store.set_booking_status(booking_id, "confirmed")
+
+        # notify user that booking is confirmed
         try:
             await context.bot.send_message(
                 b.user_id,
-                "✅ *Запись подтверждена!*\n\n"
+                "✅ <b>Запись подтверждена!</b>\n\n"
                 f"• {fmt_dt_ru(b.book_date, b.book_time)}\n"
-                f"• {b.service_title}\n\n"
+                f"• {h(b.service_title)}\n\n"
                 f"{contacts_text()}",
-                parse_mode="Markdown",
-                reply_markup=contacts_inline()
+                parse_mode="HTML",
+                reply_markup=contacts_inline(),
             )
-        except Exception:
-            pass
-        await q.message.reply_text(f"✅ Подтверждено (ID {booking_id})")
+        except Exception as e:
+            log.warning("Failed to notify user about confirmation: %s", e)
+
+        await show_flow_message(chat_id, context, f"✅ Подтверждено (ID {booking_id})")
         return
 
     if data.startswith("ADM_CANCEL:") and is_admin(uid):
         booking_id = int(data.split(":", 1)[1])
         b = store.get_booking(booking_id)
         if not b:
-            await q.message.reply_text("Запись не найдена.")
+            await show_flow_message(chat_id, context, "Запись не найдена.")
             return
         store.set_booking_status(booking_id, "cancelled")
         try:
             await context.bot.send_message(
                 b.user_id,
-                "❌ *Запись отменена мастером.*\n\n"
+                "❌ <b>Запись отменена мастером.</b>\n\n"
                 f"• {fmt_dt_ru(b.book_date, b.book_time)}\n"
-                f"• {b.service_title}\n\n"
+                f"• {h(b.service_title)}\n\n"
                 "Хотите — подберём другое время 🙂",
-                parse_mode="Markdown",
+                parse_mode="HTML"
             )
         except Exception:
             pass
-        await q.message.reply_text(f"❌ Отменено (ID {booking_id})")
+        await show_flow_message(chat_id, context, f"❌ Отменено (ID {booking_id})")
         return
 
-    # block/unblock simplest (через кнопки времени как у клиента — без ручного ввода)
+    # admin block/unblock
     if data == "ADM_BLOCK" and is_admin(uid):
-        context.user_data["adm_mode"] = "block"
-        # выбираем дату как обычные дни (используем временный draft)
         did = set_draft(context)
-        context.user_data["adm_draft"] = did
-        await q.message.reply_text("⛔ Выберите дату для блокировки:", reply_markup=kb_days(did))
+        context.user_data["adm_mode"] = "block"
+        await show_flow_message(chat_id, context, "⛔ Выберите дату для блокировки:",
+                                reply_markup=kb_admin_days(did, "block"))
         return
 
     if data == "ADM_UNBLOCK" and is_admin(uid):
-        context.user_data["adm_mode"] = "unblock"
         did = set_draft(context)
-        context.user_data["adm_draft"] = did
-        await q.message.reply_text("✅ Выберите дату для разблокировки:", reply_markup=kb_days(did))
+        context.user_data["adm_mode"] = "unblock"
+        await show_flow_message(chat_id, context, "✅ Выберите дату для разблокировки:",
+                                reply_markup=kb_admin_days(did, "unblock"))
         return
 
-    # если админ выбрал дату — он попадёт в DAY:did:date (мы уже обрабатываем)
-    # поэтому различаем режимом adm_mode:
-    if data.startswith("DAY:"):
-        # перехватим внутри общего обработчика? — уже обработали выше и показали слоты
-        # но админ-режим потребует другие коллбеки, поэтому ниже ничего не делаем.
+    p = split3("ADM_DAYB")
+    if p and is_admin(uid):
+        did, day_iso = p
+        if not must_draft(context, did):
+            return
+        context.user_data["adm_day"] = day_iso
+        await show_flow_message(chat_id, context, f"⛔ Блокировка: {fmt_date_ru(day_iso)}",
+                                reply_markup=kb_admin_slots(did, day_iso, "block"))
         return
 
-    return
+    p = split3("ADM_DAYU")
+    if p and is_admin(uid):
+        did, day_iso = p
+        if not must_draft(context, did):
+            return
+        context.user_data["adm_day"] = day_iso
+        await show_flow_message(chat_id, context, f"✅ Разблокировка: {fmt_date_ru(day_iso)}",
+                                reply_markup=kb_admin_slots(did, day_iso, "unblock"))
+        return
+
+    p = split3("ADM_BSET")
+    if p and is_admin(uid):
+        did, hhmm4 = p
+        if not must_draft(context, did):
+            return
+        day_iso = context.user_data.get("adm_day")
+        t = dec_time(hhmm4)
+        if not day_iso:
+            return
+        if is_slot_taken_overlap(day_iso, t):
+            await show_flow_message(chat_id, context, "Слот уже занят записью, блокировать нельзя.")
+            return
+        store.block_slot(day_iso, t)
+        await show_flow_message(chat_id, context, f"⛔ Заблокировано: {fmt_dt_ru(day_iso, t)}",
+                                reply_markup=kb_admin_slots(did, day_iso, "block"))
+        return
+
+    p = split3("ADM_USET")
+    if p and is_admin(uid):
+        did, hhmm4 = p
+        if not must_draft(context, did):
+            return
+        day_iso = context.user_data.get("adm_day")
+        t = dec_time(hhmm4)
+        if not day_iso:
+            return
+        store.unblock_slot(day_iso, t)
+        await show_flow_message(chat_id, context, f"✅ Разблокировано: {fmt_dt_ru(day_iso, t)}",
+                                reply_markup=kb_admin_slots(did, day_iso, "unblock"))
+        return
 
 
 # =========================
-# Startup / error / app
+# Startup / errors / app
 # =========================
 async def on_startup(app: Application):
     reschedule_all_reminders(app)
-    log.info("Startup: reminders rescheduled.")
+    log.info("Startup complete: reminders rescheduled.")
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error: %s", context.error)
 
 def build_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
     app.add_error_handler(on_error)
-    app.post_init = on_startup
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
