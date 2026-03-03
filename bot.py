@@ -1,223 +1,290 @@
 import os
 import sqlite3
 import logging
+import asyncio
 from datetime import datetime, timedelta, date
+from typing import Optional
+
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton, 
     InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
-    CallbackQueryHandler, ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, filters, ApplicationBuilder
 )
+from telegram.error import Forbidden, BadRequest
 
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("BeautyBot")
+# =========================================================
+# 1. КОНФИГУРАЦИЯ (ОБЯЗАТЕЛЬНО ЗАПОЛНИТЬ)
+# =========================================================
+TOKEN = "ВАШ_ТОКЕН_ИЗ_BOTFATHER"
+ADMIN_ID = 123456789  # Ваш числовой ID (узнать в @userinfobot)
+SALON_NAME = "💎 LUXURY BEAUTY STUDIO"
 
-# 2. БАЗА ДАННЫХ (SQLite)
-class Storage:
-    def __init__(self, path: str = "data.sqlite3"):
-        self.path = path
-        self._init_db()
+# Настройка логирования для отладки
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-    def _conn(self):
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        return conn
+# =========================================================
+# 2. СИСТЕМА ХРАНЕНИЯ ДАННЫХ (SQLITE)
+# =========================================================
+class Database:
+    def __init__(self, db_name="salon_beauty.db"):
+        self.db_name = db_name
+        self._create_tables()
 
-    def _init_db(self):
-        with self._conn() as c:
-            # Таблица пользователей
-            c.execute("""CREATE TABLE IF NOT EXISTS users(
-                tg_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, 
-                phone TEXT, created_at TEXT)""")
-            # Таблица записей с флагами для напоминаний
-            c.execute("""CREATE TABLE IF NOT EXISTS bookings(
-                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, 
-                service_title TEXT, price INTEGER, 
-                book_date TEXT, book_time TEXT, comment TEXT, 
-                status TEXT, remind_24h INTEGER DEFAULT 0, 
-                remind_1h INTEGER DEFAULT 0, created_at TEXT)""")
+    def _execute(self, query, params=(), fetchone=False, fetchall=False, commit=False):
+        with sqlite3.connect(self.db_name) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            if commit: conn.commit()
+            if fetchone: return cursor.fetchone()
+            if fetchall: return cursor.fetchall()
+            return cursor
 
-    def upsert_user(self, tg_id, username, name, phone):
-        with self._conn() as c:
-            c.execute("INSERT INTO users VALUES(?,?,?,?,?) ON CONFLICT(tg_id) DO UPDATE SET full_name=excluded.full_name, phone=excluded.phone",
-                      (tg_id, username, name, phone, datetime.now().isoformat()))
+    def _create_tables(self):
+        # Таблица пользователей
+        self._execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                phone TEXT,
+                reg_date DATETIME
+            )""", commit=True)
+        # Таблица записей
+        self._execute("""
+            CREATE TABLE IF NOT EXISTS bookings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                service_name TEXT,
+                b_date TEXT,
+                b_time TEXT,
+                comment TEXT,
+                remind_24h INTEGER DEFAULT 0,
+                remind_1h INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active'
+            )""", commit=True)
 
-    def get_user(self, tg_id):
-        with self._conn() as c:
-            return c.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+    def add_user(self, uid, username, name, phone):
+        self._execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?)", 
+                      (uid, username, name, phone, datetime.now()), commit=True)
 
-    def create_booking(self, uid, stitle, price, bdate, btime, comment):
-        with self._conn() as c:
-            cur = c.execute("INSERT INTO bookings(user_id, service_title, price, book_date, book_time, comment, status, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                      (uid, stitle, price, bdate, btime, comment, 'confirmed', datetime.now().isoformat()))
-            return cur.lastrowid
+    def get_user(self, uid):
+        return self._execute("SELECT * FROM users WHERE user_id = ?", (uid,), fetchone=True)
 
-    def get_active_reminders(self):
-        with self._conn() as c:
-            return c.execute("SELECT * FROM bookings WHERE status='confirmed' AND (remind_24h=0 OR remind_1h=0)").fetchall()
+    def add_booking(self, uid, service, b_date, b_time, comment):
+        self._execute("INSERT INTO bookings (user_id, service_name, b_date, b_time, comment) VALUES (?, ?, ?, ?, ?)",
+                      (uid, service, b_date, b_time, comment), commit=True)
 
-    def mark_reminded(self, bid, col):
-        with self._conn() as c:
-            c.execute(f"UPDATE bookings SET {col}=1 WHERE id=?", (bid,))
+    def get_user_bookings(self, uid):
+        return self._execute("SELECT * FROM bookings WHERE user_id = ? AND status = 'active' ORDER BY b_date, b_time", (uid,), fetchall=True)
 
-store = Storage()
+    def get_all_active_bookings(self):
+        return self._execute("SELECT b.*, u.full_name, u.phone FROM bookings b JOIN users u ON b.user_id = u.user_id WHERE b.status = 'active'", fetchall=True)
 
-# 3. КОНФИГУРАЦИЯ
-# ВНИМАНИЕ: Замените эти данные на свои!
-BOT_TOKEN = "ВАШ_ТОКЕН_ИЗ_BOTFATHER"
-ADMIN_ID = 123456789  # Ваш числовой ID (узнать можно в @userinfobot)
+db = Database()
 
-# Состояния (Stages)
-REG_NAME, REG_PHONE, ADD_COMMENT = "RN", "RP", "AC"
+# =========================================================
+# 3. ВСПОМОГАТЕЛЬНЫЕ КЛАВИАТУРЫ
+# =========================================================
+def main_kb(uid):
+    buttons = [
+        [KeyboardButton("💅 Записаться на процедуру")],
+        [KeyboardButton("📅 Мои записи"), KeyboardButton("💰 Прайс-лист")],
+        [KeyboardButton("📍 Контакты и адрес")]
+    ]
+    if uid == ADMIN_ID:
+        buttons.append([KeyboardButton("🛠 Админ-панель")])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 SERVICES = {
-    "s1": ("Маникюр + Покрытие", 2500),
-    "s2": ("Педикюр + Покрытие", 3000),
-    "s3": ("Наращивание", 4500)
+    "manic": "Маникюр + Покрытие (2500₽)",
+    "pedic": "Педикюр (3000₽)",
+    "complex": "Комплекс в 4 руки (5000₽)"
 }
 
-# 4. КЛАВИАТУРЫ
-def get_main_menu(uid):
-    btns = [["💅 Записаться", "📅 Мои записи"], ["💰 Цены", "📍 Контакты"]]
-    if uid == ADMIN_ID:
-        btns.append(["🛠 Админ-панель"])
-    return ReplyKeyboardMarkup(btns, resize_keyboard=True)
-
-# 5. ФОНОВЫЕ НАПОМИНАНИЯ
-async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# 4. ФОНОВЫЕ ЗАДАЧИ (НАПОМИНАНИЯ)
+# =========================================================
+async def reminder_callback(context: ContextTypes.DEFAULT_TYPE):
+    """Проверка записей и отправка уведомлений каждые 60 секунд"""
     now = datetime.now()
-    bookings = store.get_active_reminders()
+    bookings = db.get_all_active_bookings()
     
     for b in bookings:
         try:
-            appt_dt = datetime.strptime(f"{b['book_date']} {b['book_time']}", "%Y-%m-%d %H:%M")
-            diff = appt_dt - now
+            appt_time = datetime.strptime(f"{b['b_date']} {b['b_time']}", "%Y-%m-%d %H:%M")
+            time_diff = appt_time - now
             
-            # За 24 часа
-            if timedelta(hours=23) < diff <= timedelta(hours=24) and not b['remind_24h']:
-                await context.bot.send_message(b['user_id'], f"🔔 Напоминание: Завтра в {b['book_time']} ждем вас на {b['service_title']}!")
-                store.mark_reminded(b['id'], "remind_24h")
+            # Напоминание за 24 часа
+            if timedelta(hours=23) < time_diff <= timedelta(hours=24) and not b['remind_24h']:
+                await context.bot.send_message(b['user_id'], f"🔔 Напоминание! Завтра в {b['b_time']} ждем вас на {b['service_name']}! ✨")
+                db._execute("UPDATE bookings SET remind_24h = 1 WHERE id = ?", (b['id'],), commit=True)
             
-            # За 1 час
-            elif timedelta(minutes=50) < diff <= timedelta(hours=1, minutes=5) and not b['remind_1h']:
-                await context.bot.send_message(b['user_id'], f"⚡️ Ждем вас через час ({b['book_time']}) на процедуру: {b['service_title']}!")
-                store.mark_reminded(b['id'], "remind_1h")
+            # Напоминание за 1 час
+            elif timedelta(minutes=55) < time_diff <= timedelta(hours=1, minutes=5) and not b['remind_1h']:
+                await context.bot.send_message(b['user_id'], f"⚡️ Ждем вас через час ({b['b_time']})! Не опаздывайте 🤗")
+                db._execute("UPDATE bookings SET remind_1h = 1 WHERE id = ?", (b['id'],), commit=True)
+                
         except Exception as e:
-            log.error(f"Ошибка напоминания: {e}")
+            logger.error(f"Ошибка в системе напоминаний: {e}")
 
-# 6. ОБРАБОТЧИКИ
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# 5. ОСНОВНАЯ ЛОГИКА БОТА
+# =========================================================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = store.get_user(uid)
-    context.user_data.clear() # Сброс всех временных данных
+    user = db.get_user(uid)
+    context.user_data.clear()
 
     if not user:
-        context.user_data["stage"] = REG_NAME
-        await update.message.reply_text("Добро пожаловать! ✨ Как мне к вам обращаться?", reply_markup=ReplyKeyboardRemove())
+        context.user_data["step"] = "WAITING_NAME"
+        await update.message.reply_text(
+            f"Добро пожаловать в {SALON_NAME}! ✨\n\nВы у нас впервые. Пожалуйста, введите ваше **Имя** для регистрации:",
+            parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
+        )
     else:
-        await update.message.reply_text(f"Рады видеть вас снова, {user['full_name']}!", reply_markup=get_main_menu(uid))
+        await update.message.reply_text(
+            f"Рады видеть вас снова, {user['full_name']}! 👋\nЧем могу помочь сегодня?",
+            reply_markup=main_kb(uid)
+        )
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text
-    user = store.get_user(uid)
-    stage = context.user_data.get("stage")
+    step = context.user_data.get("step")
+    user = db.get_user(uid)
 
-    # Если юзер в базе, блокируем стадии регистрации
-    if user and stage in [REG_NAME, REG_PHONE]:
-        context.user_data["stage"] = None
-        stage = None
-
-    if stage == REG_NAME:
-        context.user_data["tmp_name"] = text
-        context.user_data["stage"] = REG_PHONE
-        kb = ReplyKeyboardMarkup([[KeyboardButton("📱 Отправить контакт", request_contact=True)]], resize_keyboard=True)
-        await update.message.reply_text("Теперь нажмите кнопку ниже, чтобы отправить номер телефона:", reply_markup=kb)
+    # --- ЛОГИКА РЕГИСТРАЦИИ ---
+    if step == "WAITING_NAME":
+        context.user_data["reg_name"] = text
+        context.user_data["step"] = "WAITING_PHONE"
+        btn = [[KeyboardButton("📱 Отправить номер", request_contact=True)]]
+        await update.message.reply_text(f"Приятно познакомиться, {text}! Теперь отправьте ваш номер телефона для связи:", 
+                                         reply_markup=ReplyKeyboardMarkup(btn, resize_keyboard=True))
         return
 
-    if stage == ADD_COMMENT:
+    # --- ЛОГИКА ЗАПИСИ (КОММЕНТАРИЙ) ---
+    if step == "WAITING_COMMENT":
         context.user_data["comment"] = text
-        context.user_data["stage"] = None
-        s_title, s_price = SERVICES[context.user_data["s_key"]]
-        msg = (f"🧐 *Проверьте запись:*\n\n💅 {s_title}\n📅 {context.user_data['date']}\n⏰ {context.user_data['time']}\n💬 {text}")
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ ПОДТВЕРДИТЬ", callback_data="final_ok")],
-                                   [InlineKeyboardButton("❌ ОТМЕНА", callback_data="cancel")]])
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+        context.user_data["step"] = None
+        s_name = SERVICES[context.user_data["svc"]]
+        d, t = context.user_data["date"], context.user_data["time"]
+        
+        summary = (f"🧐 *Проверьте вашу запись:*\n\n"
+                   f"💅 Услуга: {s_name}\n"
+                   f"📅 Дата: {d}\n"
+                   f"⏰ Время: {t}\n"
+                   f"💬 Комментарий: {text}\n\n"
+                   f"Все верно?")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, подтверждаю!", callback_data="confirm_final")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_booking")]
+        ])
+        await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=kb)
         return
 
-    # Главное меню
-    if text == "💅 Записаться":
-        kb = [[InlineKeyboardButton(f"{v[0]} ({v[1]}₽)", callback_data=f"svc_{k}")] for k, v in SERVICES.items()]
-        await update.message.reply_text("Выберите услугу:", reply_markup=InlineKeyboardMarkup(kb))
+    # --- ГЛАВНОЕ МЕНЮ ---
+    if text == "💅 Записаться на процедуру":
+        btns = [[InlineKeyboardButton(name, callback_data=f"svc_{key}")] for key, name in SERVICES.items()]
+        await update.message.reply_text("Выберите желаемую услугу:", reply_markup=InlineKeyboardMarkup(btns))
 
-async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    elif text == "📅 Мои записи":
+        books = db.get_user_bookings(uid)
+        if not books:
+            await update.message.reply_text("У вас пока нет активных записей. Хотите записаться?")
+        else:
+            res = "🗓 *Ваши ближайшие визиты:*\n\n"
+            for b in books:
+                res += f"📍 {b['b_date']} в {b['b_time']} — {b['service_name']}\n"
+            await update.message.reply_text(res, parse_mode="Markdown")
+
+    elif text == "🛠 Админ-панель" and uid == ADMIN_ID:
+        all_b = db.get_all_active_bookings()
+        report = f"📊 *Всего активных записей:* {len(all_b)}\n\n"
+        for ab in all_b[:10]: # Показываем последние 10
+            report += f"👤 {ab['full_name']} | {ab['b_date']} {ab['b_time']}\n📞 {ab['phone']}\n---\n"
+        await update.message.reply_text(report, parse_mode="Markdown")
+
+    elif text == "💰 Прайс-лист":
+        p = "💳 *Наши услуги:*\n\n" + "\n".join([f"• {v}" for v in SERVICES.values()])
+        await update.message.reply_text(p, parse_mode="Markdown")
+
+async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if context.user_data.get("stage") == REG_PHONE:
+    if context.user_data.get("step") == "WAITING_PHONE":
         phone = update.message.contact.phone_number
-        store.upsert_user(uid, update.effective_user.username, context.user_data["tmp_name"], phone)
+        name = context.user_data.get("reg_name")
+        db.add_user(uid, update.effective_user.username, name, phone)
         context.user_data.clear()
-        await update.message.reply_text("Регистрация завершена! 🎉", reply_markup=get_main_menu(uid))
+        await update.message.reply_text(f"✅ Регистрация завершена! Теперь вы можете записываться на услуги.", 
+                                         reply_markup=main_kb(uid))
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     uid = update.effective_user.id
+    data = query.data
     await query.answer()
 
-    if query.data.startswith("svc_"):
-        context.user_data["s_key"] = query.data.split("_")[1]
-        days = [[InlineKeyboardButton((date.today() + timedelta(days=i)).strftime("%d.%m"), 
-                callback_data=f"date_{(date.today() + timedelta(days=i)).isoformat()}")] for i in range(1, 6)]
-        await query.edit_message_text("Выберите дату:", reply_markup=InlineKeyboardMarkup(days))
+    if data.startswith("svc_"):
+        context.user_data["svc"] = data.split("_")[1]
+        # Выбор даты (на 7 дней вперед)
+        dates_kb = []
+        for i in range(1, 8):
+            d = (date.today() + timedelta(days=i)).isoformat()
+            dates_kb.append([InlineKeyboardButton(d, callback_data=f"date_{d}")])
+        await query.edit_message_text("На какой день планируем визит?", reply_markup=InlineKeyboardMarkup(dates_kb))
 
-    elif query.data.startswith("date_"):
-        context.user_data["date"] = query.data.split("_")[1]
-        kb = [[InlineKeyboardButton(t, callback_data=f"time_{t}")] for t in ["10:00", "13:00", "16:00", "19:00"]]
-        await query.edit_message_text("Выберите время:", reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("date_"):
+        context.user_data["date"] = data.split("_")[1]
+        times = ["10:00", "12:30", "15:00", "17:30", "20:00"]
+        times_kb = [[InlineKeyboardButton(t, callback_data=f"time_{t}")] for t in times]
+        await query.edit_message_text("Выберите свободное время:", reply_markup=InlineKeyboardMarkup(times_kb))
 
-    elif query.data.startswith("time_"):
-        context.user_data["time"] = query.data.split("_")[1]
-        context.user_data["stage"] = ADD_COMMENT
-        await query.edit_message_text("Напишите комментарий (дизайн, снятие и т.д.) или отправьте '-'")
+    elif data.startswith("time_"):
+        context.user_data["time"] = data.split("_")[1]
+        context.user_data["step"] = "WAITING_COMMENT"
+        await query.edit_message_text("Почти готово! Напишите короткое пожелание (дизайн, снятие и т.д.) или просто '-'")
 
-    elif query.data == "final_ok":
-        s_title, s_price = SERVICES[context.user_data["s_key"]]
-        bid = store.create_booking(uid, s_title, s_price, context.user_data["date"], 
-                                   context.user_data["time"], context.user_data.get("comment", "-"))
+    elif data == "confirm_final":
+        db.add_booking(uid, SERVICES[context.user_data["svc"]], context.user_data["date"], 
+                       context.user_data["time"], context.user_data["comment"])
+        await query.edit_message_text("✅ Вы успешно записаны! Напоминания придут за 24 часа и за 1 час до начала.")
         
-        # УВЕДОМЛЕНИЕ АДМИНУ
-        user = store.get_user(uid)
-        admin_msg = (f"🔥 *НОВАЯ ЗАПИСЬ #{bid}*\n\n"
-                     f"👤 Клиент: {user['full_name']}\n"
-                     f"📞 Тел: `{user['phone']}`\n"
-                     f"🔗 Ник: @{user['username'] if user['username'] else 'нет'}\n"
-                     f"💅 Услуга: {s_title}\n"
-                     f"📅 Дата: {context.user_data['date']}\n"
-                     f"⏰ Время: {context.user_data['time']}\n"
-                     f"💬 Комм: {context.user_data['comment']}")
-        
-        try: await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode="Markdown")
+        # Уведомление админу
+        u = db.get_user(uid)
+        admin_text = (f"🔔 *НОВАЯ ЗАПИСЬ!*\n\nКлиент: {u['full_name']}\nТел: `{u['phone']}`\n"
+                      f"Услуга: {SERVICES[context.user_data['svc']]}\nДата: {context.user_data['date']} {context.user_data['time']}")
+        try:
+            await context.bot.send_message(ADMIN_ID, admin_text, parse_mode="Markdown")
         except: pass
+        context.user_data.clear()
 
-        context.user_data.clear() # Очистка
-        await query.edit_message_text(f"✅ Запись #{bid} подтверждена! Ждем вас.")
-        await context.bot.send_message(uid, "Вы вернулись в главное меню:", reply_markup=get_main_menu(uid))
+    elif data == "cancel_booking":
+        context.user_data.clear()
+        await query.edit_message_text("Запись отменена. Возвращайтесь, когда будете готовы!")
 
-# 7. ЗАПУСК
+# =========================================================
+# 6. ЗАПУСК
+# =========================================================
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Запуск напоминаний раз в минуту
-    app.job_queue.run_repeating(reminder_job, interval=60, first=10)
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    
-    print("Бот запущен...")
+    # Включаем планировщик задач
+    app.job_queue.run_repeating(reminder_callback, interval=60, first=10)
+
+    # Регистрируем обработчики
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    print("--- БОТ ЗАПУЩЕН И ГОТОВ К РАБОТЕ ---")
     app.run_polling()
 
 if __name__ == "__main__":
