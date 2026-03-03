@@ -25,6 +25,7 @@ class Booking:
     comment: str
     status: str      # pending/confirmed/cancelled
     created_at: str
+    reminder_sent: int  # 0/1
 
 
 class Storage:
@@ -59,8 +60,7 @@ class Storage:
                 book_time TEXT NOT NULL,
                 comment TEXT DEFAULT '',
                 status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(tg_id)
+                created_at TEXT NOT NULL
             );
             """)
             c.execute("""
@@ -70,6 +70,11 @@ class Storage:
                 PRIMARY KEY(book_date, book_time)
             );
             """)
+
+            # --- migration: add reminder_sent if missing
+            cols = [r["name"] for r in c.execute("PRAGMA table_info(bookings)").fetchall()]
+            if "reminder_sent" not in cols:
+                c.execute("ALTER TABLE bookings ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0;")
 
     # ---------- users ----------
     def upsert_user(self, tg_id: int, username: str, full_name: str, phone: str) -> None:
@@ -152,8 +157,8 @@ class Storage:
         now = datetime.utcnow().isoformat(timespec="seconds")
         with self._conn() as c:
             cur = c.execute("""
-            INSERT INTO bookings(user_id, service_key, service_title, price, book_date, book_time, comment, status, created_at)
-            VALUES(?,?,?,?,?,?,?,?,?)
+            INSERT INTO bookings(user_id, service_key, service_title, price, book_date, book_time, comment, status, created_at, reminder_sent)
+            VALUES(?,?,?,?,?,?,?,?,?,0)
             """, (user_id, service_key, service_title, int(price), book_date, book_time, comment or "", "pending", now))
             return int(cur.lastrowid)
 
@@ -162,22 +167,15 @@ class Storage:
             row = c.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
             if not row:
                 return None
-            return Booking(
-                id=row["id"],
-                user_id=row["user_id"],
-                service_key=row["service_key"],
-                service_title=row["service_title"],
-                price=row["price"],
-                book_date=row["book_date"],
-                book_time=row["book_time"],
-                comment=row["comment"] or "",
-                status=row["status"],
-                created_at=row["created_at"],
-            )
+            return self._row_to_booking(row)
 
     def set_booking_status(self, booking_id: int, status: str) -> None:
         with self._conn() as c:
             c.execute("UPDATE bookings SET status=? WHERE id=?", (status, booking_id))
+
+    def mark_reminder_sent(self, booking_id: int) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE bookings SET reminder_sent=1 WHERE id=?", (booking_id,))
 
     def list_user_upcoming(self, user_id: int) -> List[Booking]:
         with self._conn() as c:
@@ -207,6 +205,15 @@ class Storage:
             """, (int(limit),)).fetchall()
             return [self._row_to_booking(r) for r in rows]
 
+    def list_for_reminders(self) -> List[Booking]:
+        with self._conn() as c:
+            rows = c.execute("""
+            SELECT * FROM bookings
+            WHERE status IN ('pending','confirmed') AND reminder_sent=0
+            ORDER BY book_date, book_time
+            """).fetchall()
+            return [self._row_to_booking(r) for r in rows]
+
     def _row_to_booking(self, row: sqlite3.Row) -> Booking:
         return Booking(
             id=row["id"],
@@ -219,4 +226,5 @@ class Storage:
             comment=row["comment"] or "",
             status=row["status"],
             created_at=row["created_at"],
+            reminder_sent=int(row["reminder_sent"]) if "reminder_sent" in row.keys() else 0,
         )
