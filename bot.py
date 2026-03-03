@@ -857,6 +857,12 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_draft(context)
     await cleanup_bot_messages(context, update.effective_chat.id, keep_flow=True)
     await send_clean(update, context, "🏠 Меню 👇", reply_markup=main_menu_kb(update.effective_user.id))
+    async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    clear_draft(context)
+    await flow_show(update, context, "🛠 Админ-панель", kb_admin_panel(), remove_reply=True)
 
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("stage") != STAGE_REG_PHONE:
@@ -1060,10 +1066,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_user_input(update, context)
         return
 
-    if txt == "🛠 Админ-панель" and is_admin(uid):
-        await flow_show(update, context, "🛠 Админ-панель", kb_admin_panel(), remove_reply=True)
-        await delete_user_input(update, context)
-        return
+if is_admin(uid) and txt.replace("-", "-").strip() in ("🛠 Админ-панель", "🛠 Админ панель", "Админ-панель", "Админ панель"):
+    clear_draft(context)
+    await flow_show(update, context, "🛠 Админ-панель", kb_admin_panel(), remove_reply=True)
+    await delete_user_input(update, context)
+    return
 
     await send_clean(update, context, "Выберите действие в меню 👇", reply_markup=main_menu_kb(uid))
     await delete_user_input(update, context)
@@ -1483,6 +1490,7 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
@@ -1494,3 +1502,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
