@@ -1,7 +1,7 @@
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, date
-from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime
+from typing import Optional, List
 
 
 @dataclass
@@ -64,40 +64,12 @@ class Storage:
             );
             """)
             c.execute("""
-            CREATE TABLE IF NOT EXISTS settings(
-                k TEXT PRIMARY KEY,
-                v TEXT NOT NULL
-            );
-            """)
-            c.execute("""
             CREATE TABLE IF NOT EXISTS blocked_slots(
                 book_date TEXT NOT NULL,
                 book_time TEXT NOT NULL,
                 PRIMARY KEY(book_date, book_time)
             );
             """)
-            # default settings
-            self._set_default("tz", "Europe/Moscow")
-            self._set_default("work_start", "10:00")
-            self._set_default("work_end", "20:00")
-            self._set_default("slot_minutes", "60")
-            self._set_default("lead_days", "14")
-
-    def _set_default(self, k: str, v: str):
-        with self._conn() as c:
-            row = c.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
-            if row is None:
-                c.execute("INSERT INTO settings(k,v) VALUES(?,?)", (k, v))
-
-    # ---------- settings ----------
-    def get_setting(self, k: str, default: str = "") -> str:
-        with self._conn() as c:
-            row = c.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
-            return row["v"] if row else default
-
-    def set_setting(self, k: str, v: str) -> None:
-        with self._conn() as c:
-            c.execute("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
 
     # ---------- users ----------
     def upsert_user(self, tg_id: int, username: str, full_name: str, phone: str) -> None:
@@ -142,6 +114,15 @@ class Storage:
     def unblock_slot(self, book_date: str, book_time: str) -> None:
         with self._conn() as c:
             c.execute("DELETE FROM blocked_slots WHERE book_date=? AND book_time=?", (book_date, book_time))
+
+    def list_blocked_for_day(self, book_date: str) -> List[str]:
+        with self._conn() as c:
+            rows = c.execute("""
+                SELECT book_time FROM blocked_slots
+                WHERE book_date=?
+                ORDER BY book_time
+            """, (book_date,)).fetchall()
+            return [r["book_time"] for r in rows]
 
     def is_slot_blocked(self, book_date: str, book_time: str) -> bool:
         with self._conn() as c:
@@ -216,7 +197,7 @@ class Storage:
             """, (day,)).fetchall()
             return [self._row_to_booking(r) for r in rows]
 
-    def list_next(self, limit: int = 20) -> List[Booking]:
+    def list_next(self, limit: int = 25) -> List[Booking]:
         with self._conn() as c:
             rows = c.execute("""
             SELECT * FROM bookings
