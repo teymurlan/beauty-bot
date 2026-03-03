@@ -71,7 +71,7 @@ class Storage:
             );
             """)
 
-            # --- migration: add reminder_sent if missing
+            # migration: add reminder_sent if missing
             cols = [r["name"] for r in c.execute("PRAGMA table_info(bookings)").fetchall()]
             if "reminder_sent" not in cols:
                 c.execute("ALTER TABLE bookings ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0;")
@@ -106,10 +106,6 @@ class Storage:
         with self._conn() as c:
             c.execute("DELETE FROM users WHERE tg_id=?", (tg_id,))
             c.execute("DELETE FROM bookings WHERE user_id=?", (tg_id,))
-
-    def count_users(self) -> int:
-        with self._conn() as c:
-            return int(c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"])
 
     # ---------- slots ----------
     def block_slot(self, book_date: str, book_time: str) -> None:
