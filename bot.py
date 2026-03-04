@@ -35,11 +35,11 @@ TZ_NAME = os.getenv("TZ", "Europe/Moscow").strip()
 
 ADDRESS = os.getenv("ADDRESS", "Адрес: (впишите адрес)").strip()
 HOW_TO_FIND = os.getenv("HOW_TO_FIND", "Как нас найти: (впишите ориентиры/этаж/домофон)").strip()
-MAP_URL = os.getenv("MAP_URL", "").strip()
+MAP_URL = os.getenv("MAP_URL", "").strip()  # ссылка на карты (не обязательно)
 
-# Время работы: 08:00–23:00
-WORK_START = os.getenv("WORK_START", "08:00").strip()
-WORK_END = os.getenv("WORK_END", "23:00").strip()
+# Рабочее время (можешь менять)
+WORK_START = os.getenv("WORK_START", "10:00").strip()
+WORK_END = os.getenv("WORK_END", "20:00").strip()
 SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "60").strip() or "60")
 
 if not BOT_TOKEN:
@@ -66,7 +66,7 @@ SERVICES = {
     "design": ("Дизайн ногтей (за ноготок, от)", 50),
 }
 
-# stages
+# ===== user flow states in context.user_data =====
 STAGE_NONE = "none"
 STAGE_REG_NAME = "reg_name"
 STAGE_REG_PHONE = "reg_phone"
@@ -102,7 +102,8 @@ def user_link(user_id: int, username: str) -> str:
 def main_menu_kb(user_id: int) -> ReplyKeyboardMarkup:
     kb = [
         ["💅 Записаться", "💳 Цены"],
-        ["👤 Обо мне", "📍 Контакты"],
+        ["🔥 Акции", "⭐ Отзывы"],
+        ["🖼 Фотогалерея", "📍 Контакты"],
         ["👤 Профиль", "❌ Отменить запись"],
     ]
     if is_admin(user_id):
@@ -123,16 +124,17 @@ def phone_request_kb() -> ReplyKeyboardMarkup:
     )
 
 def about_text() -> str:
-    # улучшенный текст “что может бот” (как на твоих первых скринах)
+    # улучшенная версия “что может делать этот бот” из твоих скринов
     return (
         f"✨ *{SALON_NAME}*\n\n"
-        "Здравствуйте! ✨ Добро пожаловать в наш чат-бот для записи на услуги маникюра и педикюра 💅🦶\n\n"
-        "Я помогу вам:\n"
-        "• выбрать услугу\n"
-        "• подобрать удобную дату и время\n"
-        "• отправить заявку администратору\n"
-        "• получить напоминание за 24 часа\n\n"
-        "Нажмите *💅 Записаться* — и увидите свободные окна ✅"
+        "Это чат-бот для записи на услуги маникюра и педикюра 💅🦶\n\n"
+        "Что я умею:\n"
+        "• Показать цены\n"
+        "• Записать на удобную дату и свободное время\n"
+        "• Отправить заявку администратору\n"
+        "• Напомнить о визите за 24 часа\n"
+        "• Дать контакты и как нас найти\n\n"
+        "Нажмите *💅 Записаться* — и выберите услугу 🙂"
     )
 
 def prices_text() -> str:
@@ -154,8 +156,6 @@ def prices_text() -> str:
         f"• {SERVICES['ext'][0]} — *{SERVICES['ext'][1]} ₽*",
         f"• {SERVICES['corr'][0]} — *{SERVICES['corr'][1]} ₽*",
         f"• {SERVICES['design'][0]} — *{SERVICES['design'][1]} ₽*",
-        "",
-        "Запись в пару кликов — нажмите *💅 Записаться* 🙂",
     ]
     return "\n".join(lines)
 
@@ -163,8 +163,7 @@ def contacts_text() -> str:
     t = "📍 *Контакты*\n\n"
     t += f"• {ADDRESS}\n"
     t += f"• {HOW_TO_FIND}\n"
-    t += "• Время работы: 08:00–23:00\n"
-    t += "• Запись: через *💅 Записаться*\n"
+    t += "• Время работы: 10:00–20:00\n"
     return t
 
 def contacts_inline() -> InlineKeyboardMarkup | None:
@@ -175,23 +174,12 @@ def contacts_inline() -> InlineKeyboardMarkup | None:
         rows.append([InlineKeyboardButton("🗺 Открыть карту", url=MAP_URL)])
     return InlineKeyboardMarkup(rows) if rows else None
 
-# ===== clean chat: удаляем предыдущую “карточку” бота =====
-async def send_clean(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *, parse_mode=None, reply_markup=None):
-    chat_id = update.effective_chat.id
-    prev_id = context.chat_data.get("last_bot_card_id")
-    if prev_id:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=prev_id)
-        except Exception:
-            pass
-    msg = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
-    context.chat_data["last_bot_card_id"] = msg.message_id
-
 # ===== calendar: today -> end of month =====
 def month_days_from_today() -> list[str]:
     today = now_local().date()
     first_next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
     last_day = first_next_month - timedelta(days=1)
+
     days = []
     d = today
     while d <= last_day:
@@ -224,22 +212,8 @@ def generate_time_slots(day_iso: str) -> list[str]:
     return slots
 
 def build_times_kb(day_iso: str, mode: str) -> InlineKeyboardMarkup:
+    # mode: client / adm_block / adm_unblock
     slots = generate_time_slots(day_iso)
-
-    # фильтр прошлых слотов для сегодняшнего дня (клиенту)
-    if mode == "client":
-        today_iso = now_local().date().isoformat()
-        if day_iso == today_iso:
-            now_dt = now_local()
-            filtered = []
-            for hhmm in slots:
-                t = datetime.strptime(hhmm, "%H:%M").time()
-                slot_dt = datetime.combine(now_dt.date(), t, tzinfo=tz)
-                if slot_dt > now_dt:  # строго позже текущего времени
-                    filtered.append(hhmm)
-            slots = filtered
-
-    rows, row = [], []
 
     if mode == "adm_unblock":
         blocked = set(store.list_blocked_for_day(day_iso))
@@ -249,6 +223,7 @@ def build_times_kb(day_iso: str, mode: str) -> InlineKeyboardMarkup:
                 [InlineKeyboardButton("😕 Нет заблокированных слотов", callback_data="noop")],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="adm_back_days")],
             ])
+        rows, row = [], []
         for t in shown:
             row.append(InlineKeyboardButton(t, callback_data=f"adm_unblock_time:{day_iso}|{t}"))
             if len(row) == 4:
@@ -259,6 +234,7 @@ def build_times_kb(day_iso: str, mode: str) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="adm_back_days")])
         return InlineKeyboardMarkup(rows)
 
+    rows, row = [], []
     for t in slots:
         if mode == "client":
             if store.is_slot_blocked(day_iso, t) or store.is_slot_taken(day_iso, t):
@@ -328,11 +304,12 @@ def booking_start_dt(iso_date: str, hhmm: str) -> datetime:
     return datetime.combine(d, t, tzinfo=tz)
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
-    booking_id = int(context.job.data.get("booking_id"))
-    b = store.get_booking(booking_id)
+    booking_id = context.job.data.get("booking_id")
+    b = store.get_booking(int(booking_id))
     if not b or b.reminder_sent == 1 or b.status not in ("pending", "confirmed"):
         return
 
+    # send reminder
     text = (
         "⏰ *Напоминание о записи*\n\n"
         f"• {fmt_dt_ru(b.book_date, b.book_time)}\n"
@@ -353,10 +330,12 @@ def schedule_reminder(app: Application, booking_id: int, iso_date: str, hhmm: st
     now = now_local()
 
     if remind_at <= now:
+        # если меньше 24ч — не спамим, но можно отправить за 2ч (не просили)
         return
 
     delay = (remind_at - now).total_seconds()
     name = f"rem_{booking_id}"
+    # убрать возможный дубль
     for j in app.job_queue.jobs():
         if j.name == name:
             return
@@ -370,18 +349,12 @@ def reschedule_all_reminders(app: Application):
             continue
         schedule_reminder(app, b.id, b.book_date, b.book_time)
 
-# ===== registration =====
-async def begin_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["stage"] = STAGE_REG_NAME
-    await send_clean(update, context, "Сначала короткая регистрация 🙂\nКак к вам обращаться? (имя)")
-
+# ====== start / registration ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    context.user_data["stage"] = STAGE_NONE
+    context.user_data.setdefault("stage", STAGE_NONE)
 
-    await send_clean(
-        update,
-        context,
+    await update.message.reply_text(
         f"Приветствуем в *{SALON_NAME}* 😊\n\n"
         "Запись на маникюр и педикюр — быстро и удобно.\n"
         "Нажмите *💅 Записаться* и выберите услугу.",
@@ -389,21 +362,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_kb(uid)
     )
 
-    if not store.get_user(uid):
-        await begin_registration(update, context)
+    u = store.get_user(uid)
+    if not u:
+        context.user_data["stage"] = STAGE_REG_NAME
+        await update.message.reply_text("Сначала короткая регистрация 🙂\nКак к вам обращаться? (имя)")
         return
 
-    # если уже есть профиль — покажем быстрый старт инлайном
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="Хотите записаться прямо сейчас? 👇", reply_markup=after_reg_inline())
+    # зарегистрирован
+    await update.message.reply_text("Хотите записаться прямо сейчас? 👇", reply_markup=after_reg_inline())
 
+async def begin_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["stage"] = STAGE_REG_NAME
+    await update.message.reply_text("Сначала короткая регистрация 🙂\nКак к вам обращаться? (имя)")
+
+# ===== text / contact router (без багов) =====
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("stage") != STAGE_REG_PHONE:
+    stage = context.user_data.get("stage", STAGE_NONE)
+    if stage != STAGE_REG_PHONE:
         return
 
     phone = update.message.contact.phone_number if update.message.contact else ""
     phone = parse_phone(phone)
     if len(re.sub(r"\D", "", phone)) < 10:
-        await send_clean(update, context, "Не вижу номер 😕 Нажмите «📱 Отправить номер».", reply_markup=phone_request_kb())
+        await update.message.reply_text("Не вижу номер 😕 Нажмите «📱 Отправить номер».", reply_markup=phone_request_kb())
         return
 
     uid = update.effective_user.id
@@ -411,44 +392,43 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store.upsert_user(uid, update.effective_user.username or "", name, phone)
 
     context.user_data["stage"] = STAGE_NONE
-    await send_clean(update, context, f"✅ Отлично, *{name}*!\n\nТеперь можно записаться 👇", parse_mode="Markdown", reply_markup=main_menu_kb(uid))
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="Нажмите кнопку:", reply_markup=after_reg_inline())
+    await update.message.reply_text(f"✅ Отлично, *{name}*!\n\nТеперь можно записаться 👇", parse_mode="Markdown", reply_markup=main_menu_kb(uid))
+    await update.message.reply_text("Нажмите кнопку:", reply_markup=after_reg_inline())
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = (update.message.text or "").strip()
     stage = context.user_data.get("stage", STAGE_NONE)
-    u = store.get_user(uid)
 
-    # --- REG NAME ---
+    # 1) REG NAME
     if stage == STAGE_REG_NAME:
         if len(text) < 2:
-            await send_clean(update, context, "Напишите имя чуть понятнее 🙂")
+            await update.message.reply_text("Напишите имя чуть понятнее 🙂")
             return
         context.user_data["reg_name"] = text
         context.user_data["stage"] = STAGE_REG_PHONE
-        await send_clean(update, context, "Отправьте номер телефона кнопкой ниже:", reply_markup=phone_request_kb())
+        await update.message.reply_text("Отправьте номер телефона кнопкой ниже:", reply_markup=phone_request_kb())
         return
 
-    # --- REG PHONE (если вдруг текстом) ---
+    # 2) REG PHONE (если вдруг не контакт, а текст)
     if stage == STAGE_REG_PHONE:
         phone = parse_phone(text)
         if len(re.sub(r"\D", "", phone)) < 10:
-            await send_clean(update, context, "Нажмите «📱 Отправить номер» (так без ошибок).", reply_markup=phone_request_kb())
+            await update.message.reply_text("Нажмите «📱 Отправить номер» (так без ошибок).", reply_markup=phone_request_kb())
             return
         name = context.user_data.get("reg_name", update.effective_user.full_name or "Клиент")
         store.upsert_user(uid, update.effective_user.username or "", name, phone)
         context.user_data["stage"] = STAGE_NONE
-        await send_clean(update, context, f"✅ Отлично, *{name}*!\n\nТеперь можно записаться 👇", parse_mode="Markdown", reply_markup=main_menu_kb(uid))
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Нажмите кнопку:", reply_markup=after_reg_inline())
+        await update.message.reply_text(f"✅ Отлично, *{name}*!\n\nТеперь можно записаться 👇", parse_mode="Markdown", reply_markup=main_menu_kb(uid))
+        await update.message.reply_text("Нажмите кнопку:", reply_markup=after_reg_inline())
         return
 
-    # --- BOOK COMMENT ---
+    # 3) BOOK COMMENT (если клиент пишет комментарий)
     if stage == STAGE_BOOK_COMMENT:
         context.user_data["comment"] = "" if text == "-" else text
         context.user_data["stage"] = STAGE_NONE
-        await send_clean(
-            update, context,
+        # покажем подтверждение
+        await update.message.reply_text(
             build_confirm_text(context),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -459,26 +439,54 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- MENU ---
+    # ----- MENU BUTTONS -----
+    # Если не зарегистрирован и нажал что-то кроме /start — мягко отправим на регистрацию
+    u = store.get_user(uid)
+
     if text == "💅 Записаться":
         if not u:
             await begin_registration(update, context)
             return
-        # старт записи одним inline-сообщением
-        msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="Выберите категорию услуги:", reply_markup=service_cats_kb())
-        context.chat_data["flow_msg_id"] = msg.message_id
+        await update.message.reply_text("Выберите категорию услуги:", reply_markup=service_cats_kb())
         return
 
     if text == "💳 Цены":
-        await send_clean(update, context, prices_text(), parse_mode="Markdown", reply_markup=main_menu_kb(uid))
+        await update.message.reply_text(prices_text(), parse_mode="Markdown", reply_markup=main_menu_kb(uid))
         return
 
-    if text == "👤 Обо мне":
-        await send_clean(update, context, about_text(), parse_mode="Markdown", reply_markup=main_menu_kb(uid))
+    if text == "🔥 Акции":
+        await update.message.reply_text(
+            "🔥 *Акции*\n\n"
+            "• Уточняйте актуальные предложения у администратора\n"
+            "• Можно записаться и в комментарии указать пожелания 🙂",
+            parse_mode="Markdown",
+            reply_markup=main_menu_kb(uid)
+        )
+        return
+
+    if text == "⭐ Отзывы":
+        await update.message.reply_text(
+            "⭐ *Отзывы*\n\n"
+            "Хотите — пришлём подборку отзывов.\n"
+            "Напишите одним сообщением: «хочу отзывы».",
+            parse_mode="Markdown",
+            reply_markup=main_menu_kb(uid)
+        )
+        return
+
+    if text == "🖼 Фотогалерея":
+        await update.message.reply_text(
+            "🖼 *Фотогалерея*\n\n"
+            "Сюда можно добавить ссылку на альбом/Instagram.\n"
+            "Напишите: «хочу фото работ» — и админ пришлёт подборку.",
+            parse_mode="Markdown",
+            reply_markup=main_menu_kb(uid)
+        )
         return
 
     if text == "📍 Контакты":
-        await send_clean(update, context, contacts_text(), parse_mode="Markdown", reply_markup=contacts_inline() or main_menu_kb(uid))
+        kb = contacts_inline()
+        await update.message.reply_text(contacts_text(), parse_mode="Markdown", reply_markup=kb or main_menu_kb(uid))
         return
 
     if text == "👤 Профиль":
@@ -486,13 +494,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await begin_registration(update, context)
             return
         link = user_link(u.tg_id, u.username)
-        await send_clean(
-            update, context,
+        await update.message.reply_text(
             "👤 *Профиль*\n\n"
             f"• Имя: *{u.full_name}*\n"
             f"• Телефон: *{u.phone}*\n"
             f"• Telegram: {link}\n\n"
-            "Чтобы изменить данные — напишите: `Сменить профиль`",
+            "Если хотите изменить данные — напишите: `Сменить профиль`",
             parse_mode="Markdown",
             reply_markup=main_menu_kb(uid)
         )
@@ -500,7 +507,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text.lower() in ["сменить профиль", "сброс", "сбросить профиль"]:
         store.delete_user(uid)
-        await send_clean(update, context, "✅ Профиль сброшен. Напишите /start для новой регистрации.", reply_markup=main_menu_kb(uid))
+        await update.message.reply_text("✅ Профиль сброшен. Нажмите /start для новой регистрации.", reply_markup=main_menu_kb(uid))
         return
 
     if text == "❌ Отменить запись":
@@ -509,20 +516,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         upcoming = store.list_user_upcoming(uid)
         if not upcoming:
-            await send_clean(update, context, "У вас нет активных записей 🙂", reply_markup=main_menu_kb(uid))
+            await update.message.reply_text("У вас нет активных записей 🙂", reply_markup=main_menu_kb(uid))
             return
         rows = []
         for b in upcoming:
             rows.append([InlineKeyboardButton(f"❌ {fmt_dt_ru(b.book_date, b.book_time)} — {b.service_title}", callback_data=f"ucancel:{b.id}")])
         rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="back_to_menu")])
-        await send_clean(update, context, "Выберите запись для отмены:", reply_markup=InlineKeyboardMarkup(rows))
+        await update.message.reply_text("Выберите запись для отмены:", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if text == "🛠 Админ-панель" and is_admin(uid):
-        await send_clean(update, context, "🛠 *Админ-панель*", parse_mode="Markdown", reply_markup=admin_panel_inline())
+        await update.message.reply_text("🛠 *Админ-панель*", parse_mode="Markdown", reply_markup=admin_panel_inline())
         return
 
-    # --- OTHER TEXT -> admin question ---
+    # ----- OTHER TEXT = question to admin -----
+    # (теперь это НЕ сработает во время регистрации — мы это уже исправили)
     who = f"{u.full_name} ({u.phone})" if u else (update.effective_user.full_name or "Клиент")
     link = user_link(uid, update.effective_user.username or "")
     msg = f"❓ *Вопрос из бота*\nОт: *{who}*\n{link}\n\n{text}"
@@ -530,8 +538,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
     except Exception:
         pass
-    await send_clean(update, context, "Спасибо! Я передал ваше сообщение администратору ✅", reply_markup=main_menu_kb(uid))
+    await update.message.reply_text("Спасибо! Я передал ваше сообщение администратору ✅", reply_markup=main_menu_kb(uid))
 
+# ===== booking confirm text =====
 def build_confirm_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     title = context.user_data.get("service_title")
     price = context.user_data.get("service_price")
@@ -547,6 +556,7 @@ def build_confirm_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         "Нажмите *Подтвердить* — и заявка уйдёт администратору ✅"
     )
 
+# ===== callbacks =====
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -557,10 +567,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "back_to_menu":
-        try:
-            await q.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
         await q.message.reply_text("Меню 👇", reply_markup=main_menu_kb(uid))
         return
 
@@ -569,13 +575,16 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "go_book":
-        if not store.get_user(uid):
+        u = store.get_user(uid)
+        if not u:
+            # если по инлайн нажали без регистрации
             context.user_data["stage"] = STAGE_REG_NAME
             await q.message.reply_text("Сначала короткая регистрация 🙂\nКак к вам обращаться? (имя)")
             return
         await q.message.reply_text("Выберите категорию услуги:", reply_markup=service_cats_kb())
         return
 
+    # booking flow
     if data == "back_to_service_cats":
         await q.edit_message_text("Выберите категорию услуги:", reply_markup=service_cats_kb())
         return
@@ -592,6 +601,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["service_key"] = key
         context.user_data["service_title"] = title
         context.user_data["service_price"] = int(price)
+
         await q.edit_message_text(
             f"Вы выбрали:\n*{title}* — *{price} ₽*\n\nВыберите дату:",
             parse_mode="Markdown",
@@ -625,6 +635,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t = data.split(":", 1)[1]
         context.user_data["book_time"] = t
         context.user_data["stage"] = STAGE_BOOK_COMMENT
+
         await q.edit_message_text(
             "Добавьте комментарий (необязательно).\n\n"
             "Например: «снятие», «укрепление», «френч», «пожелания по форме».\n\n"
@@ -669,14 +680,17 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("Ошибка данных. Нажмите 💅 Записаться ещё раз.", reply_markup=main_menu_kb(uid))
             return
 
+        # final slot check
         if store.is_slot_blocked(d, t) or store.is_slot_taken(d, t):
             await q.message.reply_text("Этот слот уже занят 😕 Выберите другое время.", reply_markup=main_menu_kb(uid))
             return
 
         booking_id = store.create_booking(u.tg_id, key, title, price, d, t, comment)
+
+        # schedule reminder 24h
         schedule_reminder(context.application, booking_id, d, t)
 
-        # аккуратно: редактируем это же сообщение (без нового мусора)
+        # client
         await q.edit_message_text(
             "✅ *Заявка отправлена администратору!*\n\n"
             f"• {fmt_dt_ru(d, t)}\n"
@@ -684,8 +698,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Мы подтвердим запись и пришлём уведомление 🙂",
             parse_mode="Markdown"
         )
+        await q.message.reply_text("Меню 👇", reply_markup=main_menu_kb(uid))
 
-        # notify admin
+        # admin notify
         link = user_link(u.tg_id, u.username)
         admin_text = (
             "🆕 *Новая запись*\n\n"
@@ -707,21 +722,41 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+        # clear temp
         for k in ["service_key", "service_title", "service_price", "book_date", "book_time", "comment", "book_cat"]:
             context.user_data.pop(k, None)
+
         return
 
+    # user cancel
     if data.startswith("ucancel:"):
         booking_id = int(data.split(":", 1)[1])
         b = store.get_booking(booking_id)
         if not b or b.user_id != uid:
             await q.message.reply_text("Запись не найдена.", reply_markup=main_menu_kb(uid))
             return
+
         store.set_booking_status(booking_id, "cancelled")
         await q.edit_message_text("✅ Запись отменена. Если нужно — запишитесь заново через меню.")
+
+        u = store.get_user(uid)
+        if u:
+            link = user_link(u.tg_id, u.username)
+            msg = (
+                "⚠️ *Клиент отменил запись*\n\n"
+                f"• Клиент: *{u.full_name}* ({u.phone})\n"
+                f"• Запись: *{fmt_dt_ru(b.book_date, b.book_time)}*\n"
+                f"• Услуга: *{b.service_title}*\n"
+                f"ID: `{b.id}`"
+            )
+            try:
+                await context.bot.send_message(ADMIN_ID, msg, parse_mode="Markdown",
+                                               reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Написать клиенту", url=link)]]))
+            except Exception:
+                pass
         return
 
-    # admin
+    # admin panel
     if data == "adm_today" and is_admin(uid):
         today_iso = now_local().date().isoformat()
         items = store.list_day(today_iso)
@@ -730,8 +765,8 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         lines = [f"📅 *Записи на сегодня* ({fmt_date_ru(today_iso)})", ""]
         for b in items:
-            uu = store.get_user(b.user_id)
-            who = f"{uu.full_name} ({uu.phone})" if uu else str(b.user_id)
+            u = store.get_user(b.user_id)
+            who = f"{u.full_name} ({u.phone})" if u else str(b.user_id)
             lines.append(f"• *{b.book_time}* — {b.service_title} — {who} (ID `{b.id}`)")
         await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
@@ -743,8 +778,8 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         lines = ["⏭ *Ближайшие записи*", ""]
         for b in items:
-            uu = store.get_user(b.user_id)
-            who = f"{uu.full_name} ({uu.phone})" if uu else str(b.user_id)
+            u = store.get_user(b.user_id)
+            who = f"{u.full_name} ({u.phone})" if u else str(b.user_id)
             lines.append(f"• *{fmt_dt_ru(b.book_date, b.book_time)}* — {b.service_title} — {who} (ID `{b.id}`)")
         await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
@@ -852,7 +887,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(f"❌ Отменено (ID {booking_id})")
         return
 
+# ===== startup hook =====
 async def on_startup(app: Application):
+    # восстановим напоминания после рестарта Railway
     reschedule_all_reminders(app)
     log.info("Reminders rescheduled.")
 
